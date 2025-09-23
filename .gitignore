@@ -1,3 +1,19 @@
+datasets/__pycache__/
+data/datasets
+training/rl
+training/logs
+training/test
+training/train
+training/validation
+data/datachess_games.db
+data/chess_openings.csv
+data/consoleLogOfChessGames.txt
+training/epoch
+data/invalid_games.txt
+gui/utils/replays/replay_buffer.pkl
+sos.txt
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
