@@ -1,3 +1,5 @@
+# train model with the labeled PGN data = supervised
+
 import torch
 import random
 import numpy as np
@@ -27,8 +29,8 @@ args = parser.parse_args()
 writer = SummaryWriter(log_dir="logs/supervised")
 
 # --- Зареждане на данни ---
-train_states, train_policies, train_values = load_npy_from_directory("C:\\Users\\prezi\\PycharmProjects\\chess_ai_project\\training\\train")
-val_states, val_policies, val_values = load_npy_from_directory("C:\\Users\\prezi\\PycharmProjects\\chess_ai_project\\training\\validation")
+train_states, train_policies, train_values = load_npy_from_directory("/home/presi/projects/chess_ai_project/training/train")
+val_states, val_policies, val_values = load_npy_from_directory("/home/presi/projects/chess_ai_project/training/validation")
 
 train_dataset = TensorDataset(
     torch.tensor(train_states, dtype=torch.float32).permute(0, 3, 1, 2),

@@ -6,7 +6,7 @@ from mcts import MCTS
 def test_mcts_stability():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PolicyHead().to(device)
-    model.eval()  # важно!
+    model.eval()  # важно
 
     mcts = MCTS(model, device, simulations=50, temperature=1.0)
     board = chess.Board()

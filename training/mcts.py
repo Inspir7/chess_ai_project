@@ -32,6 +32,7 @@ class MCTS:
 
     def run(self, root_board):
         root = MCTSNode(root_board.copy())
+        self.root = root
 
         if self.verbose:
             print("[MCTS] Starting search...")
@@ -115,15 +116,20 @@ class MCTS:
         policy = {}
 
         for move in legal:
-            try:
-                idx = move_to_index(move)
-                if idx == -1 or idx >= len(probs):
-                    continue
-                prob = self._safe_scalar(probs[idx])
-                policy[move] = prob
-            except Exception as e:
+            idx = move_to_index(move, self.root.board)
+
+            # Ако move_to_index не връща валиден индекс — пропускаме
+            if idx is None:
                 if self.verbose:
-                    print(f"[MCTS] Warning: Skipping move {move} due to error: {e}")
+                    '''print(f"[MCTS] Skipping unmapped move: {move.uci()}")'''
+                continue
+
+            # Проверяваме дали е валиден int и в границите на policy масива
+            if not isinstance(idx, int) or idx < 0 or idx >= len(probs):
+                continue
+
+            prob = self._safe_scalar(probs[idx])
+            policy[move] = prob
 
         total = sum(policy.values())
         if total > 0.0:
@@ -149,3 +155,28 @@ class MCTS:
         pi = self.run(board)
         best_move = max(pi.items(), key=lambda x: x[1])[0]
         return best_move
+
+    def get_visit_count_distribution(self):
+        """
+        Връща нормализирана policy-дистрибуция (π),
+        базирана на броя посещения на възлите от текущия корен.
+        Използва се в self-play за обучение на policy head.
+        """
+        # Ако няма root — връщаме празна policy
+        if not hasattr(self, 'root') or self.root is None or len(self.root.children) == 0:
+            return np.zeros(4672, dtype=np.float32)
+
+        # Инициализираме policy вектор с нули (размер = изход на модела)
+        policy = np.zeros(4672, dtype=np.float32)
+
+        # Вземаме броя посещения на всеки child възел
+        total_visits = sum(child.visit_count for child in self.root.children.values())
+        if total_visits == 0:
+            return policy
+
+        for move, child in self.root.children.items():
+            idx = move_to_index(move, self.root.board)
+            if idx != -1 and idx < len(policy):
+                policy[idx] = child.visit_count / total_visits
+
+        return policy

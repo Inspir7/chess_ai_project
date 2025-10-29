@@ -1,3 +1,5 @@
+# load trained model in order to self-play, creating new state, policy, value, which could be used for reLearning
+
 import chess
 import torch
 import numpy as np
@@ -8,139 +10,108 @@ from models.AlphaZero import AlphaZeroModel
 from training.mcts import MCTS
 from training.move_encoding import move_to_index, get_total_move_count
 from training.generate_labeled_data import fen_to_tensor
+from training.buffer import ReplayBuffer
+
 
 def sample_move_from_pi(pi_dict, temperature=1.0):
-    """Семплира ход от pi_dict със зададена температура (1.0 = нормално, <1 = по-решителен, >1 = по-хаотичен)."""
-    moves, probs = zip(*pi_dict.items())
+    """Семплира ход от pi_dict със зададена температура."""
+    moves, probs = zip(*pi_dict.items())  # ✅ поправено
     probs = np.array(probs, dtype=np.float32)
 
     if temperature == 0:
-        # Избор на най-добър ход (без стохастичност)
         return moves[np.argmax(probs)]
 
-    # Прилагане на температура
     scaled = np.power(probs, 1.0 / temperature)
     scaled /= np.sum(scaled)
-
     return random.choices(moves, weights=scaled, k=1)[0]
 
-def train_model(model, examples, optimizer, device):
-    model.train()
 
-    for state, policy, value in examples:
-        state = state.unsqueeze(0).to(device)
-        policy = policy.to(device)
-
-        # to tensor
-        value = torch.tensor(value, dtype=torch.float32).to(device)
-
-        # prediction
-        logits, predicted_value = model(state)
-
-        # legal move s
-        legal_move_indices = torch.nonzero(policy > 0, as_tuple=True)[0]  # Индекси на легалните ходове
-        logits_legal = logits[0, legal_move_indices]  # Логиците само за легалните ходове
-        policy_legal = policy[legal_move_indices]  # Политиката само за легалните ходове
-
-        # funkciq na zagubata
-        policy_loss = -torch.sum(policy_legal * torch.log_softmax(logits_legal, dim=0))  # Cross entropy loss
-        value_loss = (predicted_value - value) ** 2  # MSE loss за стойността
-
-
-        total_loss = policy_loss + value_loss
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
-
-        # log
-        print(f"Policy Loss: {policy_loss.item()}, Value Loss: {value_loss.item()}")
-
-
-
-def play_episode(model, device, simulations=50, temperature=1.0, verbose=True):
+def play_episode(model, buffer, device, simulations=50, temperature=1.0, verbose=True):
+    """Изиграва една self-play игра и тренира модела."""
     board = chess.Board()
     mcts = MCTS(model, device, simulations=simulations)
-
-    examples = []
     step = 0
-    MAX_STEPS = 200  # безопасна граница
-
-    if verbose:
-        print("\n[Self-Play] New game started.")
+    MAX_STEPS = 200
 
     while not board.is_game_over() and step < MAX_STEPS:
-        if verbose:
-            print(f"\n[Step {step}] Current position:")
-            print(board)
-
         pi_dict = mcts.run(board)
-
-        # mcts policy
-        sorted_pi = sorted(pi_dict.items(), key=lambda x: -x[1])
-        print(f"[Step {step}] MCTS Policy: {[(str(mv), round(prob, 3)) for mv, prob in sorted_pi]}")
-
-        legal_moves = list(pi_dict.keys())
-
-        # policy -> vektor
-        pi = np.zeros(get_total_move_count(), dtype=np.float32)
-        for mv in legal_moves:
-            idx = move_to_index(mv)
-            if idx >= 0:
-                pi[idx] = pi_dict[mv]
-
         chosen_move = sample_move_from_pi(pi_dict, temperature=temperature)
-        print(f"[Step {step}] Chosen move: {chosen_move} (temp={temperature})")
 
-        _, v = mcts._model_eval(board)
-        print(f"[Step {step}] Predicted value: {v:.3f}")
+        # AI пешка промоция според policy
+        if chosen_move.promotion is not None:
+            legal_promos = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
+            promo_probs = np.array([
+                pi_dict.get(chess.Move(chosen_move.from_square, chosen_move.to_square, promotion=p), 0.0)
+                for p in legal_promos
+            ])
+            if promo_probs.sum() > 0:
+                promo_probs /= promo_probs.sum()
+                chosen_move.promotion = np.random.choice(legal_promos, p=promo_probs)
+            else:
+                chosen_move.promotion = chess.QUEEN  # fallback
 
         tensor = fen_to_tensor(board.fen())
         if tensor.shape != (15, 8, 8):
             tensor = np.transpose(tensor, (2, 0, 1))
-
         state_tensor = torch.tensor(tensor, dtype=torch.float32)
-        examples.append((state_tensor, torch.tensor(pi), v))
 
+        # Преобразуваме policy dict към вектор
+        pi_vector = torch.zeros(get_total_move_count(), dtype=torch.float32)
+        for move, prob in pi_dict.items():  # ✅ поправено
+            idx = move_to_index(move)
+            if idx >= 0:
+                pi_vector[idx] = prob
+
+        buffer.push(state_tensor, pi_vector, None)
         board.push(chosen_move)
         step += 1
 
-        # pat, povtorenie
-        if board.can_claim_threefold_repetition():
-            print("[!] Threefold repetition is claimable.")
-            break
+    # Определяне на reward в края на играта
+    result_str = board.result()
+    reward = 1.0 if result_str == "1-0" else -1.0 if result_str == "0-1" else 0.0
 
-        if board.can_claim_fifty_moves():
-            print("[!] 50-move rule is claimable.")
-            break
+    # Актуализиране на value във всички примери
+    for i in range(len(buffer.buffer)):
+        state, pi, _ = buffer.buffer[i]
+        buffer.buffer[i] = (state, pi, reward)
 
-        if board.is_stalemate():
-            print("[!] Stalemate detected.")
-            break
+    # Обучение от буфера
+    model.train()
+    states, policies, values = buffer.sample(batch_size=32)
+    loss_total = 0.0
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-        if board.is_insufficient_material():
-            print("[!] Draw due to insufficient material.")
-            break
+    for state, pi_target, value_target in zip(states, policies, values):
+        state = state.unsqueeze(0).to(device)
+        pi_target_tensor = pi_target.to(device)  # вече е тензор, няма нужда от dict
+        value_target_tensor = torch.tensor(value_target, dtype=torch.float32).unsqueeze(0).to(device)
 
-    # reward
-    result = board.result()
-    reward = 1.0 if result == "1-0" else -1.0 if result == "0-1" else 0.0
+        logits, predicted_value = model(state)
+        policy_loss = -torch.sum(pi_target_tensor * torch.log_softmax(logits, dim=1))
+        value_loss = (predicted_value - value_target_tensor) ** 2
+        loss = policy_loss + value_loss
 
-    print(f"\n[Self-Play] Game finished: {result} → reward: {reward}")
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        loss_total += loss.item()
 
-    final_examples = [(s, p, reward) for (s, p, _) in examples]
+    # Лог и запис
+    if verbose:
+        avg_loss = loss_total / len(states)
+        print(f"[Self-Play] Game finished: {result_str} → reward: {reward}, Avg Loss: {avg_loss:.4f}")
+        with open("training_log.txt", "a") as f:
+            f.write(f"[Self-Play] {result_str} | reward={reward}, avg_loss={avg_loss:.4f}\n")
 
-    # След всяка игра, извършваме тренировка
-    return final_examples
+    return result_str
+
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AlphaZeroModel().to(device)  # Зареди си модела тук
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    model = AlphaZeroModel().to(device)
+    buffer = ReplayBuffer()
 
-    model.eval()
-
-    # game i train
-    for _ in range(10):  # 10 igri
-        final_examples = play_episode(model, device, simulations=50, temperature=1.0, verbose=True)
-        train_model(model, final_examples, optimizer, device)
-        print("[Self-Play] Model updated after game.")
+    NUM_GAMES = 10
+    for i in range(NUM_GAMES):
+        print(f"=== Starting Self-Play Game {i+1}/{NUM_GAMES} ===")
+        play_episode(model, buffer, device, simulations=50, temperature=1.0, verbose=True)

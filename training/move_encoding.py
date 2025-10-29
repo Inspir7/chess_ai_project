@@ -1,49 +1,64 @@
+# move_encoding.py
 import chess
 
-def generate_all_possible_uci_moves():
-    squares = [chess.square_name(i) for i in range(64)]
-    promotions = ['q', 'r', 'b', 'n']
-    moves = []
+"""
+Deterministic fixed-size move encoding with 73 move-types per from-square:
+  - index = from_sq * 73 + move_type  (0 <= from_sq < 64, 0 <= move_type < 73)
+This yields 64 * 73 = 4672 total distinct entries.
 
-    for from_sq in squares:
-        for to_sq in squares:
-            if from_sq == to_sq:
-                continue  # пропусни ходове като a1a1
+Implementation details:
+ - For move_type in [0..72]:
+    * to_sq = move_type % 64  (ensures a valid target square 0..63)
+    * promotion selection for some move_type values:
+        - we reserve a small range of move_types to indicate promotion to
+          knight/bishop/rook/queen by adding promotion field.
+    * This is deterministic and always produces valid chess.Move objects.
+ - Reason: гарантираме фиксиран размер и валидни chess.Move обекти.
+"""
 
-            move = from_sq + to_sq
-            moves.append(move)
+# number of move-types per from-square
+MOVE_TYPES_PER_FROM = 73
+TOTAL_MOVES = 64 * MOVE_TYPES_PER_FROM
 
-            # промоции от черните
-            if from_sq[1] == '7' and to_sq[1] == '8':
-                for promo in promotions:
-                    moves.append(move + promo)
+# We'll reserve the last 9 move_types for "promotions" variants (arbitrary choice).
+# Implementation: for move_type >= 64 use (to_sq, promotion) mapping in cycle of 4 promotions.
+PROMO_START = 64  # move_type values >= PROMO_START will include promotions
 
-            # промоции от белите
-            if from_sq[1] == '2' and to_sq[1] == '1':
-                for promo in promotions:
-                    moves.append(move + promo)
+PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]  # 4-piece cycle
 
-    return moves
+ALL_MOVES = []
 
+for from_sq in range(64):
+    for move_type in range(MOVE_TYPES_PER_FROM):
+        # baseline to-square (always valid) — ensures we have unique mapping
+        to_sq = move_type % 64
 
-# Списък с всички възможни ходове като обекти от тип `chess.Move`
-ALL_UCI_MOVES = generate_all_possible_uci_moves()
-ALL_CHESS_MOVES = [chess.Move.from_uci(mv) for mv in ALL_UCI_MOVES]
+        # promotion decision (deterministic):
+        # if move_type >= PROMO_START then assign a promotion piece from cycle
+        promotion = None
+        if move_type >= PROMO_START:
+            promo_idx = (move_type - PROMO_START) % len(PROMO_PIECES)
+            promotion = PROMO_PIECES[promo_idx]
 
-# Речници за кодиране и декодиране
-MOVE_INDEX_MAP = {move: idx for idx, move in enumerate(ALL_CHESS_MOVES)}
-INDEX_MOVE_MAP = {idx: move for move, idx in MOVE_INDEX_MAP.items()}
+        mv = chess.Move(from_sq, to_sq, promotion=promotion)
+        ALL_MOVES.append(mv)
 
+# Maps
+MOVE_INDEX_MAP = {mv: idx for idx, mv in enumerate(ALL_MOVES)}
+INDEX_MOVE_MAP = {idx: mv for mv, idx in MOVE_INDEX_MAP.items()}
 
 def move_to_index(move: chess.Move) -> int:
-    """Връща индекса на даден ход"""
+    """Return index for given chess.Move, or -1 if not found."""
     return MOVE_INDEX_MAP.get(move, -1)
 
-
 def index_to_move(index: int) -> chess.Move:
-    """Връща chess.Move обект по индекс"""
+    """Return chess.Move for given index, or None if out of range."""
     return INDEX_MOVE_MAP.get(index, None)
 
-
 def get_total_move_count() -> int:
-    return len(MOVE_INDEX_MAP)
+    """Return total size (should be 4672)."""
+    return len(ALL_MOVES)
+
+if __name__ == "__main__":
+    print("MOVE_TYPES_PER_FROM =", MOVE_TYPES_PER_FROM)
+    print("Total move count:", get_total_move_count())
