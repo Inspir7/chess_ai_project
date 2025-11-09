@@ -1,4 +1,4 @@
-# data/FENtoTensor.py
+# ne e nujno
 import chess
 import numpy as np
 

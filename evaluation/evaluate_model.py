@@ -1,3 +1,4 @@
+#тества върху етикетирани данни и извежда топ-1 / топ-3 accuracy и value loss.
 import torch
 import numpy as np
 from torch.utils.data import DataLoader

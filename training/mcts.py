@@ -1,10 +1,10 @@
 import math
 import torch
 import torch.nn.functional as F
-import chess
 import numpy as np
-from training.generate_labeled_data import fen_to_tensor
-from models.move_encoding import move_to_index, index_to_move
+from data.generate_labeled_data import fen_to_tensor
+from models.move_encoding import move_to_index
+
 
 class MCTSNode:
     def __init__(self, board, parent=None, prior=0.0):
@@ -37,13 +37,30 @@ class MCTS:
         if self.verbose:
             print("[MCTS] Starting search...")
 
-        # Initial expansion
+        # === Initial expansion ===
         policy, _ = self._model_eval(root.board)
+
+        # === ✅ Add Dirichlet noise at the root for exploration ===
+        epsilon = 0.25  # weight of noise
+        alpha = 0.3  # Dirichlet concentration
+        legal_moves = list(policy.keys())
+        if len(legal_moves) > 0:
+            noise = np.random.dirichlet([alpha] * len(legal_moves))
+            for i, move in enumerate(legal_moves):
+                policy[move] = (1 - epsilon) * policy[move] + epsilon * noise[i]
+
+            # renormalize
+            total = sum(policy.values())
+            for mv in policy:
+                policy[mv] /= total
+
+        # === Expand root node children ===
         for move, p in policy.items():
             next_board = root.board.copy()
             next_board.push(move)
             root.children[move] = MCTSNode(next_board, parent=root, prior=p)
 
+        # === Simulations ===
         for sim in range(self.simulations):
             node = root
             search_path = [node]

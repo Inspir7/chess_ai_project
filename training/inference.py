@@ -2,8 +2,7 @@ import torch
 import chess
 import numpy as np
 from models.AlphaZero import AlphaZeroModel
-from models.encoder import Encoder
-from training.generate_labeled_data import determine_phase, move_to_index  # твоите функции
+from data.generate_labeled_data import determine_phase, move_to_index  # твоите функции
 
 # Устройството
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

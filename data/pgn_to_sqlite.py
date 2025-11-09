@@ -1,3 +1,5 @@
+#sushtestveno v proekta - shte ima nujda ot popravqne na komentarite
+
 import os
 import sqlite3
 import glob

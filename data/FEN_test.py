@@ -1,3 +1,4 @@
+# ne e nujno
 import chess
 import chess.svg
 import matplotlib.pyplot as plt

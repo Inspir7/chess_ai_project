@@ -1,3 +1,5 @@
+# analiz na bazata danni i sudurjanie
+
 import sqlite3
 import pandas as pd
 import seaborn as sns

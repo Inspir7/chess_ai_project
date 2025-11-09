@@ -1,64 +1,114 @@
-# move_encoding.py
 import chess
 
-"""
-Deterministic fixed-size move encoding with 73 move-types per from-square:
-  - index = from_sq * 73 + move_type  (0 <= from_sq < 64, 0 <= move_type < 73)
-This yields 64 * 73 = 4672 total distinct entries.
-
-Implementation details:
- - For move_type in [0..72]:
-    * to_sq = move_type % 64  (ensures a valid target square 0..63)
-    * promotion selection for some move_type values:
-        - we reserve a small range of move_types to indicate promotion to
-          knight/bishop/rook/queen by adding promotion field.
-    * This is deterministic and always produces valid chess.Move objects.
- - Reason: гарантираме фиксиран размер и валидни chess.Move обекти.
-"""
-
-# number of move-types per from-square
 MOVE_TYPES_PER_FROM = 73
 TOTAL_MOVES = 64 * MOVE_TYPES_PER_FROM
 
-# We'll reserve the last 9 move_types for "promotions" variants (arbitrary choice).
-# Implementation: for move_type >= 64 use (to_sq, promotion) mapping in cycle of 4 promotions.
-PROMO_START = 64  # move_type values >= PROMO_START will include promotions
+# Directions (dx, dy): x = file (column), y = rank (row)
+DIRECTIONS = [
+    (1, 0), (-1, 0), (0, 1), (0, -1),     # rook-like
+    (1, 1), (1, -1), (-1, 1), (-1, -1)    # bishop-like
+]
 
-PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]  # 4-piece cycle
+KNIGHT_OFFSETS = [
+    (2, 1), (1, 2), (-1, 2), (-2, 1),
+    (-2, -1), (-1, -2), (1, -2), (2, -1)
+]
+
+PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
 
 ALL_MOVES = []
 
+
+def in_bounds(file, rank):
+    return 0 <= file < 8 and 0 <= rank < 8
+
+
 for from_sq in range(64):
-    for move_type in range(MOVE_TYPES_PER_FROM):
-        # baseline to-square (always valid) — ensures we have unique mapping
-        to_sq = move_type % 64
+    file = chess.square_file(from_sq)
+    rank = chess.square_rank(from_sq)
+    move_type = 0
 
-        # promotion decision (deterministic):
-        # if move_type >= PROMO_START then assign a promotion piece from cycle
-        promotion = None
-        if move_type >= PROMO_START:
-            promo_idx = (move_type - PROMO_START) % len(PROMO_PIECES)
-            promotion = PROMO_PIECES[promo_idx]
+    # Sliding moves (8 directions × up to 7 steps)
+    for dx, dy in DIRECTIONS:
+        for dist in range(1, 8):
+            tx, ty = file + dx * dist, rank + dy * dist
+            if in_bounds(tx, ty):
+                to_sq = chess.square(tx, ty)
+                ALL_MOVES.append(chess.Move(from_sq, to_sq))
+                move_type += 1
+            else:
+                break
 
-        mv = chess.Move(from_sq, to_sq, promotion=promotion)
-        ALL_MOVES.append(mv)
+    # Knight moves (8 offsets)
+    for dx, dy in KNIGHT_OFFSETS:
+        tx, ty = file + dx, rank + dy
+        if in_bounds(tx, ty):
+            to_sq = chess.square(tx, ty)
+            ALL_MOVES.append(chess.Move(from_sq, to_sq))
+            move_type += 1
 
-# Maps
+    # Pawn promotions (both colors)
+    if rank == 6:  # white pawn promotions
+        for dx in [-1, 0, 1]:
+            tx, ty = file + dx, rank + 1
+            if in_bounds(tx, ty):
+                to_sq = chess.square(tx, ty)
+                for promo_piece in PROMO_PIECES:
+                    ALL_MOVES.append(chess.Move(from_sq, to_sq, promotion=promo_piece))
+                    move_type += 1
+    if rank == 1:  # black pawn promotions
+        for dx in [-1, 0, 1]:
+            tx, ty = file + dx, rank - 1
+            if in_bounds(tx, ty):
+                to_sq = chess.square(tx, ty)
+                for promo_piece in PROMO_PIECES:
+                    ALL_MOVES.append(chess.Move(from_sq, to_sq, promotion=promo_piece))
+                    move_type += 1
+
+    # Add castling moves for king squares
+    if from_sq in [chess.E1, chess.E8]:
+        if from_sq == chess.E1:
+            ALL_MOVES.append(chess.Move.from_uci("e1g1"))
+            ALL_MOVES.append(chess.Move.from_uci("e1c1"))
+            move_type += 2
+        elif from_sq == chess.E8:
+            ALL_MOVES.append(chess.Move.from_uci("e8g8"))
+            ALL_MOVES.append(chess.Move.from_uci("e8c8"))
+            move_type += 2
+
+    # Fill remaining slots
+    while move_type < MOVE_TYPES_PER_FROM:
+        ALL_MOVES.append(chess.Move(from_sq, from_sq))
+        move_type += 1
+
+# Build lookup tables
 MOVE_INDEX_MAP = {mv: idx for idx, mv in enumerate(ALL_MOVES)}
 INDEX_MOVE_MAP = {idx: mv for mv, idx in MOVE_INDEX_MAP.items()}
+
 
 def move_to_index(move: chess.Move) -> int:
     """Return index for given chess.Move, or -1 if not found."""
     return MOVE_INDEX_MAP.get(move, -1)
 
+
 def index_to_move(index: int) -> chess.Move:
-    """Return chess.Move for given index, or None if out of range."""
+    """Return chess.Move for given index, or None if invalid."""
     return INDEX_MOVE_MAP.get(index, None)
 
+
 def get_total_move_count() -> int:
-    """Return total size (should be 4672)."""
     return len(ALL_MOVES)
 
+
 if __name__ == "__main__":
-    print("MOVE_TYPES_PER_FROM =", MOVE_TYPES_PER_FROM)
-    print("Total move count:", get_total_move_count())
+    print("Total moves:", get_total_move_count())
+    test_moves = [
+        chess.Move.from_uci("g8f6"),  # knight
+        chess.Move.from_uci("b8a6"),  # knight
+        chess.Move.from_uci("e7d8q"), # white promotion capture
+        chess.Move.from_uci("e7f8r"), # white promotion capture
+        chess.Move.from_uci("e1g1"),  # castling
+        chess.Move.from_uci("e8c8")   # castling
+    ]
+    for mv in test_moves:
+        print(f"{mv.uci()} → {move_to_index(mv)}")

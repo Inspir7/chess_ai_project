@@ -128,7 +128,7 @@ if __name__ == '__main__':
     multiprocessing.freeze_support()
 
     print("Извличане на FEN позиции и резултати от базата данни...")
-    conn = sqlite3.connect("C:\\Users\\prezi\\PycharmProjects\\chess_ai_project\\data\\datachess_games.db")
+    conn = sqlite3.connect("/home/presi/projects/chess_ai_project/data/datachess_games.db")
     cursor = conn.cursor()
     cursor.execute("SELECT fen, result FROM games")
     fen_rows = cursor.fetchall()

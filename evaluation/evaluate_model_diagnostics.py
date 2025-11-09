@@ -1,3 +1,4 @@
+#Сравнява предсказаните policy/value изходи на модела спрямо етикетирани данни (supervised test set).
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
