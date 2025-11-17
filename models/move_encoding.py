@@ -63,19 +63,30 @@ def index_to_move(index, board):
 
 def direction_to_index(d_row, d_col):
     """
-    Map a (d_row, d_col) to a unique direction index from 0 to 55.
+    Map a (d_row, d_col) to a unique direction index from 0 to 55 + 8 (64 total)
     """
     directions = []
+
+    # Линейни и диагонални
     for dr in range(-7, 8):
         for dc in range(-7, 8):
             if dr == 0 and dc == 0:
                 continue
             if abs(dr) == abs(dc) or dr == 0 or dc == 0:
                 directions.append((dr, dc))
+
+    # Добавяме конски ходове (L-образни)
+    knight_moves = [
+        (2, 1), (1, 2), (-1, 2), (-2, 1),
+        (-2, -1), (-1, -2), (1, -2), (2, -1)
+    ]
+    directions.extend(knight_moves)
+
     try:
         return directions.index((d_row, d_col))
     except ValueError:
         return None
+
 
 def index_to_direction(index):
     """
@@ -89,3 +100,9 @@ def index_to_direction(index):
             if abs(dr) == abs(dc) or dr == 0 or dc == 0:
                 directions.append((dr, dc))
     return directions[index]
+
+def get_total_move_count():
+    """
+    Връща общия брой възможни ходове в AlphaZero-style encoding.
+    """
+    return MAX_MOVES

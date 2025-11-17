@@ -1,7 +1,7 @@
 # test_move_encoding_random_positions.py
 import chess
 import random
-from move_encoding import move_to_index
+from models.move_encoding import move_to_index
 
 def generate_random_positions(num_positions=100):
     """Generate random legal positions by playing random moves from the starting board."""

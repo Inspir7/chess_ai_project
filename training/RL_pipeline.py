@@ -1,4 +1,3 @@
-# training/RL_pipeline.py (patched v2)
 import os
 import random
 import time
@@ -25,11 +24,11 @@ except Exception:
 # моите модели/код (твои файлове)
 from models.AlphaZero import AlphaZeroModel
 from models.move_encoding import index_to_move, move_to_index
-from training.mcts import MCTS
+# използваме стабилния self_play, който събира примери без да тренира вътрешно
+from training.self_play import play_episode
 from utils.chess_utils import initial_board, board_to_tensor, game_over, result_from_perspective
 
 # Твоите self-play и buffer (използваме ги директно)
-from training.self_play import play_episode
 from training.buffer import ReplayBuffer as UserReplayBuffer  # това е буферът от training/buffer.py
 
 # ensure headless pygame in workers (helps when pygame is imported elsewhere)
@@ -41,7 +40,7 @@ GAMES_PER_PROCESS = 1  # each worker plays 1 game per collection round
 SELFPLAY_SAVE_DIR = "training/rl/selfplay_data"
 LOG_DIR = "training/logs"
 STATS_CSV = os.path.join(LOG_DIR, "rl_stats.csv")
-WORKER_TIMEOUT_SEC = 3600  # per-worker watchdog (seconds)
+WORKER_TIMEOUT_SEC = 5000  # per-worker watchdog (seconds) - adjust if you expect longer runs
 
 # silence noisy warnings in workers (keeps logs readable)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -71,12 +70,10 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
 
     def push(self, examples):
-        # examples: iterable of (state, policy_vector, value)
-        # if called with single triple, extend expects an iterable; try to detect both cases
+        # examples: iterable of (state, policy_vector, value) OR single triple
         try:
-            # if examples is a list/iterable of tuples -> extend
             first = next(iter(examples))
-            # if we get here, it's an iterable
+            # iterable of tuples
             self.buffer.extend(examples)
         except TypeError:
             # single tuple passed
@@ -129,7 +126,7 @@ class ReplayBuffer:
 # -----------------------
 # Module-level worker function (picklable)
 # -----------------------
-def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, temperature, games_per_worker, queue, verbose=False):
+def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, temperature, games_per_worker, queue, c_puct=None, verbose=False):
     """
     Each worker:
      - creates a local AlphaZeroModel
@@ -141,7 +138,6 @@ def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, tempe
     This function is designed to be picklable and robust: it posts a "started" message early
     and posts "error" with traceback if anything fails.
     """
-    # minimal local imports to ensure picklability
     try:
         import torch as _torch
         import traceback as _traceback
@@ -191,12 +187,11 @@ def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, tempe
         game_results = []
         game_lengths = []
 
-        # we will use the user's ReplayBuffer (which exposes .buffer list)
+        # run games
         for g in range(games_per_worker):
             user_buffer = UserReplayBuffer()  # training/buffer.ReplayBuffer()
             try:
-                # run self-play; play_episode may internally do a small local training,
-                # but importantly it appends (state,pi,value) to user_buffer.buffer
+                # run self-play: note play_episode uses MCTS internally; it's CPU-only here
                 result_str = play_episode(model=model, buffer=user_buffer, device=_torch.device("cpu"),
                                           simulations=sims, temperature=temperature, verbose=verbose)
             except Exception as e:
@@ -208,7 +203,6 @@ def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, tempe
                 return
 
             # collect examples from user_buffer.buffer
-            # user_buffer.buffer likely contains tuples (state_tensor, pi_vector, value)
             for (s, p, v) in list(user_buffer.buffer):
                 if isinstance(s, np.ndarray):
                     s_t = _torch.tensor(s, dtype=_torch.float32)
@@ -218,12 +212,21 @@ def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, tempe
                 s_t = s_t.detach().cpu()
                 p_t = p_t.detach().cpu()
 
-                # --- ново: коригиране на стойността спрямо perspective ---
-                try:
-                    from utils.chess_utils import result_from_perspective
-                    v_f = result_from_perspective(v)
-                except Exception:
-                    v_f = 0.0 if v is None else float(v)
+                # --- VALUE conversion (PATCH) ---
+                # play_episode() now stores values already "from side-to-move perspective"
+                # i.e. value = +1 if the player to move in that state eventually wins,
+                # value = -1 if that player eventually loses, value = 0 for draw.
+                # Therefore DO NOT re-run result_from_perspective on v; prefer direct float conversion.
+                if v is None:
+                    v_f = 0.0
+                else:
+                    try:
+                        v_f = float(v)
+                    except Exception:
+                        try:
+                            v_f = result_from_perspective(v)
+                        except Exception:
+                            v_f = 0.0
 
                 collected_examples.append((s_t, p_t, v_f))
 
@@ -256,16 +259,14 @@ def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, tempe
                 tmp_path = os.path.join(tempfile.gettempdir(), f"worker_{worker_id}_examples.pt")
 
             try:
-                # torch.save of a list of small tensors is fine; saved file will be read by master
                 _torch.save({"examples": collected_examples}, tmp_path)
             except Exception:
-                # fallback: try to convert tensors to cpu numpy arrays (more robust for pickle)
+                # fallback: convert to numpy arrays for robust pickle
                 serializable = []
                 for (s, p, v) in collected_examples:
                     s_numpy = s.detach().cpu().numpy() if isinstance(s, _torch.Tensor) else np.array(s)
                     p_numpy = p.detach().cpu().numpy() if isinstance(p, _torch.Tensor) else np.array(p)
                     serializable.append((s_numpy, p_numpy, v))
-                # save the numpy-serializable form
                 _torch.save({"examples": serializable}, tmp_path)
 
             queue.put({
@@ -279,7 +280,6 @@ def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, tempe
         except Exception as e:
             tb = _traceback.format_exc()
             print(f"[Worker {worker_id}] Failed to put final result to queue: {e}\n{tb}")
-            # try an alternate simple report
             try:
                 queue.put({"worker_id": worker_id, "error": f"final queue.put failed: {e}\n{tb}"})
             except Exception:
@@ -305,7 +305,7 @@ class RLPipeline:
     def __init__(self,
                  model_path="/home/presi/projects/chess_ai_project/training/alpha_zero_supervised.pth",
                  device=None,
-                 lr=1e-3,
+                 lr=1e-4,
                  weight_decay=1e-4,
                  buffer_capacity=200_000,
                  move_vector_size=4672,
@@ -317,6 +317,7 @@ class RLPipeline:
             self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
 
         self.model = AlphaZeroModel().to(self.device)
+        # lower lr by default for stability in RL pipeline
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         # keep CrossEntropyLoss object for compatibility (not used for distributional)
         self.policy_loss_fn = nn.CrossEntropyLoss()
@@ -449,7 +450,7 @@ class RLPipeline:
 
         for i in range(num_processes):
             p = ctx.Process(target=_worker_self_play,
-                            args=(i, model_state_dict, self.move_vector_size, sims, temperature, games_per_worker, queue, False))
+                            args=(i, model_state_dict, self.move_vector_size, sims, temperature, games_per_worker, queue, None, False))
             p.start()
             processes.append(p)
 
@@ -492,7 +493,14 @@ class RLPipeline:
                         for (s, p, v) in exs:
                             s_t = torch.tensor(s, dtype=torch.float32) if not isinstance(s, torch.Tensor) else s.detach().cpu()
                             p_t = torch.tensor(p, dtype=torch.float32) if not isinstance(p, torch.Tensor) else p.detach().cpu()
-                            v_f = 0.0 if v is None else float(v)
+                            # PATCH: tolerant value conversion
+                            try:
+                                v_f = 0.0 if v is None else float(v)
+                            except Exception:
+                                try:
+                                    v_f = result_from_perspective(v)
+                                except Exception:
+                                    v_f = 0.0
                             safe_exs.append((s_t, p_t, v_f))
                         combined.extend(safe_exs)
                         # try to cleanup file
@@ -544,7 +552,14 @@ class RLPipeline:
                                 p_cpu = p.detach().cpu()
                             else:
                                 p_cpu = torch.tensor(p, dtype=torch.float32)
-                            v_f = 0.0 if v is None else float(v)
+                            # PATCH: tolerant value conversion
+                            try:
+                                v_f = 0.0 if v is None else float(v)
+                            except Exception:
+                                try:
+                                    v_f = result_from_perspective(v)
+                                except Exception:
+                                    v_f = 0.0
                             examples.append((s_cpu, p_cpu, v_f))
                         # cleanup temp file
                         try:
@@ -609,6 +624,17 @@ class RLPipeline:
         states = states.to(self.device)
         policies = policies.to(self.device)   # expected shape (B, move_dim), sum to 1
         values = values.to(self.device)       # shape (B,1)
+
+        # PATCH: diagnostic on batch value distribution (helps verify non-zero targets)
+        try:
+            with torch.no_grad():
+                vals_cpu = values.squeeze(1).cpu().numpy()
+                neg = (vals_cpu < -0.5).sum()
+                zero = ((vals_cpu >= -0.5) & (vals_cpu <= 0.5)).sum()
+                pos = (vals_cpu > 0.5).sum()
+                self.log(f"[DIAG] Batch values -> pos:{int(pos)} zero:{int(zero)} neg:{int(neg)} (batch {len(vals_cpu)})")
+        except Exception:
+            pass
 
         self.model.train()
         out_policy, out_value = self.model(states)  # out_policy: logits (B, move_dim), out_value: (B,1) or (B,)
@@ -692,9 +718,11 @@ class RLPipeline:
         except Exception:
             pass
 
-    def run_training(self, episodes=50, train_steps=20, batch_size=64, sims=100, verbose=False, collect_in_parallel=True):
+    def run_training(self, episodes=50, train_steps=20, batch_size=64, sims=300, temperature=1.0, verbose=False, collect_in_parallel=True):
         """
         Главен RL loop: for ep -> parallel self-play collection -> add to buffer -> some train steps -> checkpoint
+
+        По подразбиране sims=300 (повече симулации за по-качествени self-play партии в началото).
         """
         self.log(f"[RL] Starting training for {episodes} episodes...")
         avg_losses = []
@@ -706,9 +734,9 @@ class RLPipeline:
                     collected, game_results, game_lengths = self._collect_self_play_parallel(num_processes=NUM_PROCESSES,
                                                                                             games_per_worker=GAMES_PER_PROCESS,
                                                                                             sims=sims,
-                                                                                            temperature=1.0)
+                                                                                            temperature=temperature)
                 else:
-                    examples, logs = self.self_play_episode(mcts_sims=sims, temperature=1.0, verbose=verbose)
+                    examples, logs = self.self_play_episode(mcts_sims=sims, temperature=temperature, verbose=verbose)
                     collected = examples
                     game_results = []
                     game_lengths = []
@@ -790,4 +818,5 @@ if __name__ == "__main__":
         model_path="/home/presi/projects/chess_ai_project/training/alpha_zero_supervised.pth",
         move_vector_size=4672  # adjust if your move encoding differs
     )
+    # default sims set higher for better self-play examples
     pipeline.run_training(episodes=20, train_steps=15, batch_size=64, sims=400, verbose=True)

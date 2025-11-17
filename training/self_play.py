@@ -1,12 +1,9 @@
-# load trained model in order to self-play, creating new state, policy, value, which could be used for reLearning
-
 import chess
 import torch
 import numpy as np
 import random
-import time
-from torch import optim
 
+from torch import optim  # вече не се използва, но го оставям за съвместимост
 from models.AlphaZero import AlphaZeroModel
 from training.mcts import MCTS
 from training.move_encoding import move_to_index, get_total_move_count
@@ -15,133 +12,137 @@ from training.buffer import ReplayBuffer
 
 
 def sample_move_from_pi(pi_dict, temperature=1.0):
-    """Семплира ход от pi_dict със зададена температура."""
-    if not pi_dict:
-        return None
+    """Семплира ход от pi_dict със зададена температура.
+    Очакваме pi_dict да съдържа вероятности или visit-counts (нормализирани/ненормализирани).
+    """
+    # Поддържаме както probability-distribution, така и raw counts (те също работят)
     moves, probs = zip(*pi_dict.items())
     probs = np.array(probs, dtype=np.float32)
 
-    if temperature == 0 or np.sum(probs) == 0:
+    # Ако вероятностите изглеждат като visit counts (не сумаризират до 1), нека ги нормализираме
+    s = probs.sum()
+    if s > 0:
+        probs = probs / s
+    else:
+        # fallback: uniform
+        probs = np.ones_like(probs, dtype=np.float32) / len(probs)
+
+    if temperature == 0:
         return moves[np.argmax(probs)]
 
     scaled = np.power(probs, 1.0 / temperature)
-    scaled /= np.sum(scaled)
+    scaled_sum = scaled.sum()
+    if scaled_sum > 0:
+        scaled /= scaled_sum
+    else:
+        scaled = np.ones_like(scaled) / len(scaled)
+
     return random.choices(moves, weights=scaled, k=1)[0]
 
 
 def play_episode(model, buffer, device, simulations=50, temperature=1.0, verbose=True):
-    """Изиграва една self-play игра и тренира модела."""
+    """
+    Изиграва една self-play игра и събира (state, policy, value) примери в buffer.
+    Внимание: buffer.push трябва да приема (state_tensor, pi_vector, value) или единичен triple.
+    Алгоритъм (AlphaZero style):
+      - за всяко състояние: записваме state и π (от visit counts / mcts distribution)
+      - в края: определяме резултата z в {+1,-1,0} (от гледната точка на белите)
+      - за всяка записана позиция: value = z * (1 if player_to_move == white else -1)
+    """
     board = chess.Board()
     mcts = MCTS(model, device, simulations=simulations)
+    game_history = []     # съхраняваме (state_tensor, pi_vector, player_to_move_sign)
     step = 0
-    MAX_STEPS = 200
+    MAX_STEPS = 400
 
     while not board.is_game_over() and step < MAX_STEPS:
-        try:
-            pi_dict = mcts.run(board)
-        except Exception as e:
-            print(f"[Self-Play] MCTS error: {e}")
-            break
+        pi_dict = mcts.run(board)
 
-        if not pi_dict:
-            # fallback при проблем или timeout
-            legal_moves = list(board.legal_moves)
-            if not legal_moves:
-                break
-            chosen_move = random.choice(legal_moves)
+        # --- ensure pi_dict is usable: convert counts->probs if necessary (keep original items) ---
+        # If mcts.run returned visit-counts, sample_move_from_pi and later normalization will handle it.
+        # Convert pi_dict keys (moves) to vector
+        pi_vector = torch.zeros(get_total_move_count(), dtype=torch.float32)
+        total_prob = 0.0
+        for move, prob in pi_dict.items():
+            idx = move_to_index(move)
+            if idx is None or idx < 0:
+                continue
+            try:
+                pval = float(prob)
+            except Exception:
+                pval = 0.0
+            pi_vector[idx] = pval
+            total_prob += pval
+
+        # Normalize pi_vector (PATCH) — гаранция, че пазим валидна probability distribution
+        if total_prob > 0.0:
+            pi_vector = pi_vector / float(total_prob)
         else:
-            chosen_move = sample_move_from_pi(pi_dict, temperature=temperature)
-            if chosen_move is None:
-                chosen_move = random.choice(list(board.legal_moves))
+            # fallback uniform over legal moves
+            legal = list(board.legal_moves)
+            if len(legal) > 0:
+                uniform = 1.0 / len(legal)
+                for mv in legal:
+                    idx = move_to_index(mv)
+                    if idx is not None and idx >= 0 and idx < len(pi_vector):
+                        pi_vector[idx] = uniform
 
-        # AI пешка промоция според policy
-        if chosen_move.promotion is not None:
-            legal_promos = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
-            promo_probs = np.array([
-                pi_dict.get(chess.Move(chosen_move.from_square, chosen_move.to_square, promotion=p), 0.0)
-                for p in legal_promos
-            ])
-            if promo_probs.sum() > 0:
-                promo_probs /= promo_probs.sum()
-                chosen_move.promotion = np.random.choice(legal_promos, p=promo_probs)
-            else:
-                chosen_move.promotion = chess.QUEEN  # fallback
-
+        # Encode current state
         tensor = fen_to_tensor(board.fen())
         if tensor.shape != (15, 8, 8):
             tensor = np.transpose(tensor, (2, 0, 1))
         state_tensor = torch.tensor(tensor, dtype=torch.float32)
 
-        # Преобразуваме policy dict към вектор
-        pi_vector = torch.zeros(get_total_move_count(), dtype=torch.float32)
-        if pi_dict:
-            for move, prob in pi_dict.items():
-                idx = move_to_index(move)
-                if idx >= 0:
-                    pi_vector[idx] = prob
+        # Player perspective: +1 for white to move, -1 for black to move
+        player = 1 if board.turn == chess.WHITE else -1
 
-        turn_sign = 1.0 if board.turn else -1.0
-        buffer.push(state_tensor, pi_vector, turn_sign)
+        # Append to local game history; do NOT yet assign final value
+        game_history.append((state_tensor, pi_vector, player))
+
+        # Select move according to pi_dict + temperature
+        chosen_move = sample_move_from_pi(pi_dict, temperature=temperature)
+
+        # Handle promotion sampling if necessary (keep existing logic)
+        if chosen_move.promotion is not None:
+            legal_promos = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
+            promo_probs = np.array([
+                pi_dict.get(chess.Move(chosen_move.from_square, chosen_move.to_square, promotion=p), 0.0)
+                for p in legal_promos
+            ], dtype=np.float32)
+            s = promo_probs.sum()
+            if s > 0:
+                promo_probs = promo_probs / s
+                chosen_move.promotion = np.random.choice(legal_promos, p=promo_probs)
+            else:
+                chosen_move.promotion = chess.QUEEN  # fallback
+
+        # Push move and continue
         board.push(chosen_move)
         step += 1
 
-    # Определяне на reward в края на играта
+    # Compute final reward z from White's perspective
     result_str = board.result()
-    reward = 1.0 if result_str == "1-0" else -1.0 if result_str == "0-1" else 0.0
+    if result_str == "1-0":
+        z = 1.0
+    elif result_str == "0-1":
+        z = -1.0
+    else:
+        z = 0.0
 
-    # Актуализиране на value във всички примери спрямо perspective:
-    # buffer.buffer съдържа (state, pi, turn_sign) — където turn_sign е +1.0 или -1.0
-    for i in range(len(buffer.buffer)):
-        state, pi, turn_sign = buffer.buffer[i]
+    # Assign value to all positions (AlphaZero perspective correction)
+    # value_for_position = z * (1 if player_to_move==white else -1)
+    for (s_t, pi_v, player) in game_history:
+        value = z * player
+        buffer.push(s_t, pi_v, value)
+
+    if verbose:
+        print(f"[Self-Play] Game finished: {result_str} → z: {z}, steps: {step}, positions: {len(game_history)}")
         try:
-            # Ако случайно е None или не е числов, fallback към глобалния reward
-            turn = float(turn_sign)
+            with open("training_log.txt", "a") as f:
+                f.write(f"[Self-Play] {result_str} | z={z} | steps={step} | positions={len(game_history)}\n")
         except Exception:
-            turn = 1.0
-        final_val = reward * turn  # draw -> 0, win/lose -> +/-1 от perspective
-        buffer.buffer[i] = (state, pi, final_val)
+            pass
 
-    # Обучение от буфера
-    model.train()
-    try:
-        states, policies, values = buffer.sample(batch_size=32)
-    except Exception:
-        print("[Self-Play] Not enough samples for training yet.")
-        return result_str
-
-    loss_total = 0.0
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    for state, pi_target, value_target in zip(states, policies, values):
-        state = state.unsqueeze(0).to(device)
-        pi_target_tensor = pi_target.to(device)
-
-        # 🔧 поправка на предупреждението
-        value_target_tensor = (
-            value_target.detach().clone()
-            if torch.is_tensor(value_target)
-            else torch.tensor(value_target, dtype=torch.float32)
-        ).unsqueeze(0).to(device)
-
-        logits, predicted_value = model(state)
-        policy_loss = -torch.sum(pi_target_tensor * torch.log_softmax(logits, dim=1))
-        value_loss = (predicted_value - value_target_tensor) ** 2
-        loss = policy_loss + value_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        loss_total += loss.item()
-
-    # Лог и запис
-    if verbose and len(states) > 0:
-        avg_loss = loss_total / len(states)
-        print(f"[Self-Play] Game finished: {result_str} → reward: {reward}, Avg Loss: {avg_loss:.4f}")
-        with open("training_log.txt", "a") as f:
-            f.write(f"[Self-Play] {result_str} | reward={reward}, avg_loss={avg_loss:.4f}\n")
-
-    # лека пауза за да избегнем закачане в multiproc
-    time.sleep(0.2)
     return result_str
 
 
@@ -153,4 +154,4 @@ if __name__ == "__main__":
     NUM_GAMES = 10
     for i in range(NUM_GAMES):
         print(f"=== Starting Self-Play Game {i+1}/{NUM_GAMES} ===")
-        play_episode(model, buffer, device, simulations=50, temperature=1.0, verbose=True)
+        play_episode(model, buffer, device, simulations=100, temperature=1.0, verbose=True)
