@@ -819,4 +819,4 @@ if __name__ == "__main__":
         move_vector_size=4672  # adjust if your move encoding differs
     )
     # default sims set higher for better self-play examples
-    pipeline.run_training(episodes=20, train_steps=15, batch_size=64, sims=400, verbose=True)
+    pipeline.run_training(episodes=70, train_steps=15, batch_size=64, sims=400, verbose=True)

@@ -171,7 +171,20 @@ def analyze(episodes):
     plt.title("Average Value per Episode")
     plt.xlabel("Episode")
     plt.ylabel("Avg Value")
-    plt.ylim(-1.05, 1.05)
+
+    # ===== NEW: adaptive y-axis zoom =====
+    vals = np.array(avg_values_per_ep)
+
+    vmin, vmax = vals.min(), vals.max()
+
+    # ако всичко е 0 → сложи малко пространство
+    if abs(vmax - vmin) < 1e-6:
+        padding = 0.005
+    else:
+        padding = (vmax - vmin) * 0.2
+
+    plt.ylim(vmin - padding, vmax + padding)
+    # =====================================
 
     # Scatter entropy vs avg value
     plt.subplot(2, 2, 4)
