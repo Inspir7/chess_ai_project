@@ -1,312 +1,494 @@
 import math
+from typing import Dict, Optional, Tuple, List
+
+import chess
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-from data.generate_labeled_data import fen_to_tensor
-from models.move_encoding import move_to_index
 
+from data.generate_labeled_data import fen_to_tensor
+from training.move_encoding import move_to_index, get_total_move_count
+
+
+# ============================================================
+# MCTS Node
+# ============================================================
 
 class MCTSNode:
-    def __init__(self, board, parent=None, prior=0.0):
-        self.board = board
-        self.parent = parent
-        self.prior = prior
-        self.visit_count = 0
-        self.value_sum = 0.0
-        self.children = {}
+    """
+    Един възел от MCTS дървото.
 
-    def expanded(self):
-        return len(self.children) > 0
+    Всички стойности (value_sum, q_value и т.н.) се интерпретират
+    от гледна точка на ИГРАЧА НА ХОД в този възел.
+    """
 
-    def value(self):
-        return self.value_sum / self.visit_count if self.visit_count > 0 else 0.0
+    __slots__ = (
+        "board",
+        "parent",
+        "prior",
+        "visit_count",
+        "value_sum",
+        "children",
+        "is_expanded",
+        "is_terminal",
+        "terminal_value",
+    )
 
+    def __init__(self, board: chess.Board, parent: Optional["MCTSNode"] = None, prior: float = 0.0):
+        self.board: chess.Board = board
+        self.parent: Optional[MCTSNode] = parent
+        self.prior: float = float(prior)
+
+        self.visit_count: int = 0
+        self.value_sum: float = 0.0
+        self.children: Dict[chess.Move, "MCTSNode"] = {}
+
+        self.is_expanded: bool = False
+        self.is_terminal: bool = False
+        self.terminal_value: float = 0.0  # от гледната точка на играча на ход в този възел
+
+    @property
+    def q_value(self) -> float:
+        if self.visit_count == 0:
+            return 0.0
+        return self.value_sum / self.visit_count
+
+    # --------------------------------------------------------
+
+    def _compute_terminal_value(self) -> float:
+        """
+        Връща стойност от гледна точка на ИГРАЧА НА ХОД в тази терминална позиция.
+        """
+        if not self.board.is_game_over():
+            return 0.0
+
+        result = self.board.result()  # '1-0', '0-1', '1/2-1/2', '*'
+        side = self.board.turn  # кой е на ход (обикновено губещият при мат)
+
+        if result == "1-0":
+            # ако белите са победили
+            if side == chess.WHITE:
+                return -1.0  # на ход са белите, но вече са загубили (няма ходове)
+            else:
+                return 1.0
+        elif result == "0-1":
+            # ако черните са победили
+            if side == chess.BLACK:
+                return -1.0
+            else:
+                return 1.0
+        else:
+            # реми или нещо странно
+            return 0.0
+
+    # --------------------------------------------------------
+
+    def expand(self, policy_logits: torch.Tensor):
+        """
+        Разширява възела, използвайки policy логитите от мрежата.
+
+        policy_logits: 1D тензор с размер get_total_move_count().
+        """
+        if self.is_expanded:
+            return
+
+        # Ако позицията е терминална – няма деца
+        if self.board.is_game_over():
+            self.is_terminal = True
+            self.terminal_value = self._compute_terminal_value()
+            self.is_expanded = True
+            return
+
+        legal_moves = list(self.board.legal_moves)
+        if not legal_moves:
+            # пат или някаква терминална аномалия
+            self.is_terminal = True
+            # пат → реми
+            self.terminal_value = 0.0
+            self.is_expanded = True
+            return
+
+        # Нормален случай – използваме policy логитите
+        total_moves = get_total_move_count()
+        policy = policy_logits.detach().cpu().float().view(-1)
+
+        # Уверяваме се, че policy има достатъчна дължина
+        if policy.numel() < total_moves:
+            policy = F.pad(policy, (0, total_moves - policy.numel()))
+        elif policy.numel() > total_moves:
+            policy = policy[:total_moves]
+
+        move_priors = []
+        moves_for_priors = []
+
+        for mv in legal_moves:
+            idx = move_to_index(mv)
+            if idx is None or idx < 0 or idx >= total_moves:
+                # safety – ако move_encoding не покрива хода по някаква причина
+                continue
+            moves_for_priors.append(mv)
+            move_priors.append(policy[idx].item())
+
+        # Ако поради някаква причина няма нито един валиден индекс -> униформно
+        if not moves_for_priors:
+            prob = 1.0 / len(legal_moves)
+            for mv in legal_moves:
+                child_board = self.board.copy(stack=False)
+                child_board.push(mv)
+                self.children[mv] = MCTSNode(child_board, parent=self, prior=prob)
+            self.is_expanded = True
+            return
+
+        logits = torch.tensor(move_priors, dtype=torch.float32)
+        probs = torch.softmax(logits, dim=0).numpy()
+
+        for mv, p in zip(moves_for_priors, probs):
+            child_board = self.board.copy(stack=False)
+            child_board.push(mv)
+            self.children[mv] = MCTSNode(child_board, parent=self, prior=float(p))
+
+        self.is_expanded = True
+
+
+# ============================================================
+# MCTS Core
+# ============================================================
 
 class MCTS:
-    def __init__(self, model, device, simulations=800, c_puct=1.0, temperature=1.0, verbose=False):
+    """
+    AlphaZero-подобен MCTS с:
+    - batched inference
+    - Dirichlet noise в root-а
+    - динамичен temperature за root policy
+    - repetition penalty, check/mate бонуси, stuck penalty
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        device: torch.device,
+        simulations: int = 200,
+        c_puct: float = 1.8,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_epsilon: float = 0.35,
+        draw_value_bias: float = -0.15,
+        repetition_penalty: float = 0.3,
+        aggressive_check_bonus: float = 0.1,
+        mate_bonus: float = 0.9,
+        stuck_penalty_value: float = 0.05,
+        batch_size: int = 64,
+    ):
+        """
+        :param model: AlphaZero модел с forward(x) -> (policy_logits, value)
+        :param device: torch.device ("cuda" или "cpu")
+        :param simulations: общ брой MCTS симулации
+        :param c_puct: PUCT константа
+        :param dirichlet_alpha: α за Dirichlet noise
+        :param dirichlet_epsilon: коефициент за смесване с noise-а
+        :param draw_value_bias: bias към 0 при терминални ремита (леко губещи)
+        :param repetition_penalty: наказание за ходове към repetition
+        :param aggressive_check_bonus: бонус за ходове, които дават шах
+        :param mate_bonus: бонус за ходове водещи до мат
+        :param stuck_penalty_value: наказание за позиции с много малко легални ходове
+        :param batch_size: размер на batch за inference (leaf възли)
+        """
         self.model = model
         self.device = device
         self.simulations = simulations
         self.c_puct = c_puct
-        self.temperature = temperature
-        self.verbose = verbose
-        self.root = None
 
-    # --- utility to perform a cheaper terminal check first ---
-    def _is_terminal(self, board):
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
+
+        self.draw_value_bias = draw_value_bias
+        self.repetition_penalty = repetition_penalty
+        self.aggressive_check_bonus = aggressive_check_bonus
+        self.mate_bonus_value = mate_bonus
+        self.stuck_penalty_value = stuck_penalty_value
+
+        self.batch_size = max(1, batch_size)
+        self.total_moves = get_total_move_count()
+
+    # --------------------------------------------------------
+    # Public API
+    # --------------------------------------------------------
+
+    def run(self, root_board: chess.Board, move_number: Optional[int] = None) -> Dict[chess.Move, float]:
         """
-        Cheap terminal checks first (very fast): checkmate, stalemate, insufficient material.
-        Only if those are False we fall back to a full is_game_over check with claim_draw=False
-        to avoid expensive repetition scans in the common case.
+        Стартира MCTS от root_board и връща dict {move: prob}.
         """
-        try:
-            if board.is_checkmate():
-                return True, 1.0 if board.turn == False else -1.0  # if checkmate, previous player won
-            if board.is_stalemate():
-                return True, 0.0
-            if board.is_insufficient_material():
-                return True, 0.0
-        except Exception:
-            # if any board method errors (shouldn't), fallback to full check below
-            pass
+        root = MCTSNode(root_board.copy(stack=False))
+        root_noise_applied = False
 
-        # fallback: do a full game-over check but avoid expensive claim_draw by default
-        try:
-            game_over = board.is_game_over(claim_draw=False)
-        except TypeError:
-            # older python-chess: no claim_draw param
-            game_over = board.is_game_over()
-        if game_over:
-            try:
-                res = board.result(claim_draw=False)
-            except Exception:
-                try:
-                    res = board.result()
-                except Exception:
-                    res = "1/2-1/2"
-            if res == "1-0":
-                return True, 1.0
-            elif res == "0-1":
-                return True, -1.0
-            else:
-                return True, 0.0
-        return False, 0.0
+        pending: List[Tuple[MCTSNode, List[MCTSNode]]] = []
 
-    def run(self, root_board):
-        # Use stack=False to avoid copying full move_stack when possible (big speedup on deep games)
-        try:
-            rb = root_board.copy(stack=False)
-        except TypeError:
-            rb = root_board.copy()
-        self.root = MCTSNode(rb)
+        self.model.eval()
 
-        if self.verbose:
-            print("[MCTS] Starting search...")
-
-        # === Initial expansion ===
-        policy, _ = self._model_eval(self.root.board)
-
-        # === Add Dirichlet noise at the root for exploration (if any legal moves) ===
-        epsilon = 0.25
-        alpha = 0.3
-        legal_moves = list(policy.keys())
-        if len(legal_moves) > 0:
-            try:
-                noise = np.random.dirichlet([alpha] * len(legal_moves))
-                for i, move in enumerate(legal_moves):
-                    policy[move] = (1 - epsilon) * policy[move] + epsilon * noise[i]
-                # renormalize
-                total = sum(policy.values())
-                if total > 0.0:
-                    for mv in policy:
-                        policy[mv] /= total
-            except Exception:
-                # if dirichlet fails for any reason, continue without noise
-                pass
-
-        # === Expand root node children ===
-        for move, p in policy.items():
-            try:
-                try:
-                    next_board = self.root.board.copy(stack=False)
-                except TypeError:
-                    next_board = self.root.board.copy()
-                next_board.push(move)
-                self.root.children[move] = MCTSNode(next_board, parent=self.root, prior=p)
-            except Exception:
-                # if copying or pushing fails, skip that child
-                if self.verbose:
-                    print(f"[MCTS] Warning: failed to create child for move {move}. Skipping.")
-
-        # === Simulations ===
         for sim in range(self.simulations):
-            node = self.root
-            search_path = [node]
+            node = root
+            path = [node]
 
-            # Selection — descend to a leaf
-            while node.expanded():
-                move, node = self._select_child(node)
-                search_path.append(node)
+            # -------- Selection --------
+            while True:
+                if node.is_terminal:
+                    break
+                if not node.is_expanded or not node.children:
+                    break
+                move, child = self._select_child(node)
+                node = child
+                path.append(node)
 
-            # Expansion / Evaluation
-            terminal, terminal_value = self._is_terminal(node.board)
-            if terminal:
-                value = terminal_value
+            pending.append((node, path))
+
+            # Ако имаме достатъчно leaf-ове, или сме на последна симулация
+            if len(pending) >= self.batch_size or sim == self.simulations - 1:
+                batch_nodes = [n for (n, _) in pending]
+                values = self._evaluate_and_expand_batch(batch_nodes)
+
+                # backup с draw bias за терминални ремита
+                for (leaf, path_nodes), v in zip(pending, values):
+                    v_backup = float(v)
+                    if leaf.is_terminal and abs(leaf.terminal_value) < 1e-6:
+                        v_backup += self.draw_value_bias
+                    self._backup(path_nodes, v_backup)
+
+                pending.clear()
+
+                # Dirichlet noise – веднъж, след като root е expand-нат
+                if (not root_noise_applied) and root.is_expanded and root.children:
+                    self._add_dirichlet_noise(root, move_number=move_number)
+                    root_noise_applied = True
+
+        # Превръщаме посещенията в policy
+        return self._build_root_policy(root, move_number=move_number)
+
+    # --------------------------------------------------------
+    # Batch evaluation / expansion
+    # --------------------------------------------------------
+
+    def _encode_board_batch(self, boards: List[chess.Board]) -> torch.Tensor:
+        """
+        Кодира списък от board-ове в тензор [B, 15, 8, 8].
+        """
+        tensors = []
+        for b in boards:
+            fen = b.fen()
+            arr = fen_to_tensor(fen)  # (8,8,15) или (15,8,8)
+            arr = np.array(arr, copy=False)
+
+            if arr.shape == (8, 8, 15):
+                arr = np.transpose(arr, (2, 0, 1))  # CHW
+            elif arr.shape != (15, 8, 8):
+                arr = np.reshape(arr, (15, 8, 8))
+
+            tensors.append(torch.tensor(arr, dtype=torch.float32))
+
+        x = torch.stack(tensors, dim=0).to(self.device)  # [B,15,8,8]
+        return x
+
+    def _evaluate_and_expand_batch(self, nodes: List[MCTSNode]) -> List[float]:
+        """
+        Оценява и/или разширява batch от leaf възли.
+        Връща списък от value-та за backup (едно за всеки node),
+        от гледна точка на ИГРАЧА НА ХОД в съответния възел.
+        """
+        if not nodes:
+            return []
+
+        terminal_indices: List[int] = []
+        terminal_values: List[float] = []
+        nonterm_indices: List[int] = []
+        nonterm_nodes: List[MCTSNode] = []
+
+        # Разделяме на терминални и нетерминални
+        for i, node in enumerate(nodes):
+            if node.is_terminal or node.board.is_game_over():
+                node.is_terminal = True
+                node.terminal_value = node._compute_terminal_value()
+                node.is_expanded = True
+
+                terminal_indices.append(i)
+                terminal_values.append(node.terminal_value)
             else:
-                try:
-                    policy, value = self._model_eval(node.board)
-                except Exception as e:
-                    # model.eval failed unexpectedly; treat node as draw to avoid hang
-                    if self.verbose:
-                        print(f"[MCTS] Model eval failed: {e}. Treating as draw for this simulation.")
-                    value = 0.0
-                    policy = {}
+                nonterm_indices.append(i)
+                nonterm_nodes.append(node)
 
-                # create children from returned policy (only for legal moves)
-                try:
-                    for mv, p in policy.items():
-                        if mv not in node.children:
-                            try:
-                                try:
-                                    child_board = node.board.copy(stack=False)
-                                except TypeError:
-                                    child_board = node.board.copy()
-                                child_board.push(mv)
-                                node.children[mv] = MCTSNode(child_board, parent=node, prior=p)
-                            except Exception:
-                                # skip moves that fail to copy/push
-                                if self.verbose:
-                                    print(f"[MCTS] Warning: failed to expand child move {mv}")
-                                continue
-                except Exception:
-                    # defensive: if policy iterable fails, continue
-                    pass
+        values = [0.0] * len(nodes)
 
-            # Backpropagation (negate value up the path)
-            for nd in reversed(search_path):
-                nd.visit_count += 1
-                nd.value_sum += value
-                value = -value
+        # Нетерминалните – през модела
+        if nonterm_nodes:
+            boards = [n.board for n in nonterm_nodes]
+            x = self._encode_board_batch(boards)
+            with torch.no_grad():
+                policy_logits_batch, value_batch = self.model(x)
 
-            # occasional verbose progress
-            if self.verbose and (sim + 1) % 50 == 0:
-                print(f"[MCTS] Simulation {sim + 1}/{self.simulations} complete")
+            policy_logits_batch = policy_logits_batch.view(len(nonterm_nodes), -1)
+            value_batch = value_batch.view(-1)
 
-        # Build visit distribution at root
-        visits = {move: child.visit_count for move, child in self.root.children.items()}
-        pi = self._apply_temperature(visits)
+            for idx, node, plogits, val in zip(nonterm_indices, nonterm_nodes, policy_logits_batch, value_batch):
+                node.expand(plogits)
+                v = float(val.item())
+                values[idx] = v
 
-        if self.verbose:
-            print("[MCTS] Final move probabilities:")
-            for mv, prob in sorted(pi.items(), key=lambda x: -x[1]):
-                print(f"  {mv}: {round(prob, 3)}")
+        # Терминалните – директно от terminal_value
+        for idx, v in zip(terminal_indices, terminal_values):
+            values[idx] = float(v)
 
-        return pi
+        return values
 
-    def _select_child(self, node):
-        best_score = -float('inf')
+    # --------------------------------------------------------
+    # Dirichlet noise
+    # --------------------------------------------------------
+
+    def _add_dirichlet_noise(self, root: MCTSNode, move_number: Optional[int]):
+        """
+        Смесва Dirichlet noise в priors на root-а за по-добра експлорация.
+        """
+        moves = list(root.children.keys())
+        if len(moves) <= 1:
+            return
+
+        alpha = self.dirichlet_alpha
+        eps = self.dirichlet_epsilon
+
+        # По-малко noise в по-късните фази на партията
+        if move_number is not None:
+            if move_number > 40:
+                eps *= 0.25
+            elif move_number > 20:
+                eps *= 0.5
+
+        noise = np.random.dirichlet([alpha] * len(moves))
+        for mv, n in zip(moves, noise):
+            child = root.children[mv]
+            child.prior = (1.0 - eps) * child.prior + eps * float(n)
+
+    # --------------------------------------------------------
+    # Child selection (PUCT + бонуси/наказания)
+    # --------------------------------------------------------
+
+    def _select_child(self, node: MCTSNode) -> Tuple[chess.Move, MCTSNode]:
+        """
+        Избор на дете по PUCT:
+
+            score = Q + U + check_bonus + mate_bonus - rep_pen - stuck_penalty
+        """
+        best_score = -float("inf")
         best_move = None
         best_child = None
 
-        # protect against node.visit_count == 0 (root before any visits)
         parent_visits = max(1, node.visit_count)
+        sqrt_parent = math.sqrt(parent_visits)
 
-        for move, child in node.children.items():
-            # UCB-style score with prior
-            u = self.c_puct * child.prior * math.sqrt(parent_visits) / (1 + child.visit_count)
-            score = child.value() + u
+        for mv, child in node.children.items():
+            q = child.q_value
+            u = self.c_puct * child.prior * (sqrt_parent / (1 + child.visit_count))
+
+            # Наказание за repetition (ограничено – заради липса на пълна история)
+            rep_pen = 0.0
+            try:
+                if child.board.can_claim_threefold_repetition():
+                    rep_pen = self.repetition_penalty
+            except Exception:
+                rep_pen = 0.0
+
+            # Бонус за шах
+            check_bonus = 0.0
+            try:
+                if child.board.is_check():
+                    check_bonus = self.aggressive_check_bonus
+            except Exception:
+                check_bonus = 0.0
+
+            # Бонус за мат
+            mate_bonus = 0.0
+            try:
+                if child.board.is_game_over() and child.board.is_checkmate():
+                    mate_bonus = self.mate_bonus_value
+            except Exception:
+                mate_bonus = 0.0
+
+            # Stuck penalty – много малко легални ходове
+            stuck_penalty = 0.0
+            try:
+                num_legal = child.board.legal_moves.count()
+                if num_legal <= 2:
+                    stuck_penalty = self.stuck_penalty_value
+            except Exception:
+                stuck_penalty = 0.0
+
+            score = q + u + check_bonus + mate_bonus - rep_pen - stuck_penalty
+
             if score > best_score:
                 best_score = score
-                best_move = move
+                best_move = mv
                 best_child = child
+
+        if best_child is None:
+            # safety fallback
+            best_move, best_child = next(iter(node.children.items()))
 
         return best_move, best_child
 
-    def _safe_scalar(self, prob):
-        if isinstance(prob, np.ndarray):
-            prob = prob.squeeze()
-            if getattr(prob, "size", None) != 1:
-                raise ValueError(f"Expected scalar, got array with shape {prob.shape}")
-            return float(prob.item())
-        return float(prob)
+    # --------------------------------------------------------
+    # Backup
+    # --------------------------------------------------------
 
-    def _model_eval(self, board):
+    def _backup(self, path: List[MCTSNode], leaf_value: float):
         """
-        Evaluate board using model: returns (policy_dict over legal moves, scalar value).
-        The policy is a mapping move -> probability (not necessarily normalized first).
+        Backup на leaf_value по пътя от листа към root.
+        leaf_value е от гледна точка на страната на ход в LEAF възела.
+        На всяка стъпка сменяме знака (сменя се гледната точка).
         """
-        np_tensor = fen_to_tensor(board.fen())
-        # ensure shape (1, C, H, W)
-        x = torch.tensor(np_tensor, dtype=torch.float32, device=self.device).unsqueeze(0).permute(0, 3, 1, 2)
+        v = float(leaf_value)
+        for node in reversed(path):
+            node.value_sum += v
+            node.visit_count += 1
+            v = -v  # сменяме гледната точка (играчите се редуват)
 
-        with torch.no_grad():
-            logits, value = self.model(x)
+    # --------------------------------------------------------
+    # Root policy
+    # --------------------------------------------------------
 
-        probs = F.softmax(logits, dim=1)[0].cpu()
-        legal = list(board.legal_moves)
-        policy = {}
-
-        for move in legal:
-            # try mapping move -> index (some move encoders accept board as second arg)
-            try:
-                idx = move_to_index(move, board)
-            except TypeError:
-                idx = move_to_index(move)
-
-            if idx is None:
-                # unmapped move — skip
-                if self.verbose:
-                    pass  # intentionally silent or you can log
-                continue
-
-            if not isinstance(idx, int) or idx < 0 or idx >= len(probs):
-                continue
-
-            try:
-                prob = self._safe_scalar(probs[idx])
-            except Exception:
-                prob = 0.0
-            policy[move] = prob
-
-        # normalize policy; if empty (shouldn't), fallback to uniform over legal moves
-        total = sum(policy.values())
-        if total > 0.0:
-            for mv in policy:
-                policy[mv] /= total
-        else:
-            if len(legal) > 0:
-                uniform = 1.0 / len(legal)
-                policy = {mv: uniform for mv in legal}
-            else:
-                policy = {}
-
-        return policy, float(value.item())
-
-    def _apply_temperature(self, visits):
-        temp = self.temperature
-        if not visits:
+    def _build_root_policy(self, root: MCTSNode, move_number: Optional[int]) -> Dict[chess.Move, float]:
+        """
+        Превръща visit count-овете на root-а в dict {move: prob}
+        чрез softmax с динамична температура.
+        """
+        if not root.children:
             return {}
 
-        if temp == 0:
-            best_move = max(visits.items(), key=lambda x: x[1])[0]
-            return {move: 1.0 if move == best_move else 0.0 for move in visits}
+        moves = list(root.children.keys())
+        visits = np.array([root.children[mv].visit_count for mv in moves], dtype=np.float32)
 
-        # apply temperature to visit counts (common AlphaZero behaviour)
-        visits_temp = {move: (count ** (1.0 / temp)) for move, count in visits.items()}
-        total = sum(visits_temp.values())
-        if total <= 0.0:
-            # fallback uniform
-            n = len(visits_temp)
-            return {move: 1.0 / n for move in visits_temp}
-        return {move: prob / total for move, prob in visits_temp.items()}
+        if visits.sum() <= 0:
+            # fallback към priors
+            priors = np.array([root.children[mv].prior for mv in moves], dtype=np.float32)
+            if priors.sum() <= 0:
+                priors = np.ones_like(priors)
+            priors /= priors.sum()
+            return {mv: float(p) for mv, p in zip(moves, priors)}
 
-    def select_move(self, board):
-        pi = self.run(board)
-        if not pi:
-            # fallback: choose any legal move
-            legal = list(board.legal_moves)
-            return legal[0] if legal else None
-        best_move = max(pi.items(), key=lambda x: x[1])[0]
-        return best_move
+        # Динамичен temperature schedule
+        if move_number is None:
+            temperature = 1.0
+        elif move_number < 10:
+            temperature = 1.0
+        elif move_number < 30:
+            temperature = 0.7
+        elif move_number < 50:
+            temperature = 0.4
+        else:
+            temperature = 0.2
 
-    def get_visit_count_distribution(self, vector_size=4672):
-        """
-        Returns normalized visit-count policy vector compatible with training (move vector length).
-        """
-        if not hasattr(self, 'root') or self.root is None or len(self.root.children) == 0:
-            return np.zeros(vector_size, dtype=np.float32)
+        if temperature <= 1e-6:
+            best_idx = int(np.argmax(visits))
+            pi = np.zeros_like(visits)
+            pi[best_idx] = 1.0
+        else:
+            scaled = np.power(visits, 1.0 / max(temperature, 1e-6))
+            if scaled.sum() <= 0:
+                scaled = np.ones_like(scaled)
+            pi = scaled / scaled.sum()
 
-        policy = np.zeros(vector_size, dtype=np.float32)
-        total_visits = sum(child.visit_count for child in self.root.children.values())
-        if total_visits == 0:
-            return policy
-
-        for move, child in self.root.children.items():
-            try:
-                idx = move_to_index(move, self.root.board)
-            except TypeError:
-                idx = move_to_index(move)
-            if isinstance(idx, int) and 0 <= idx < vector_size:
-                policy[idx] = child.visit_count / total_visits
-
-        return policy
+        return {mv: float(p) for mv, p in zip(moves, pi)}

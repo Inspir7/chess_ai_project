@@ -1,822 +1,573 @@
+import sys
 import os
-import random
+
+# Добавяме project root към Python path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# Сега могат да идват import-ите:
+import os
 import time
 import csv
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import random
+import traceback
 from collections import deque
 from datetime import datetime
-import numpy as np
-import multiprocessing as mp
-import signal
-import traceback
-import warnings
-import tempfile
 
-# --- improve multiprocessing/tensor sharing stability ---
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.multiprocessing as mp
+import torch.nn as nn
+import torch.optim as optim
+
+from models.AlphaZero import AlphaZeroModel
+from training.self_play import play_episode
+from training.buffer import ReplayBuffer
+
+
+# Опит за по-стабилно споделяне на тензори между процеси
 try:
     torch.multiprocessing.set_sharing_strategy("file_system")
 except Exception:
-    # older PyTorch or platforms may not support changing strategy; ignore
     pass
 
-# моите модели/код (твои файлове)
-from models.AlphaZero import AlphaZeroModel
-from models.move_encoding import index_to_move, move_to_index
-# използваме стабилния self_play, който събира примери без да тренира вътрешно
-from training.self_play import play_episode
-from utils.chess_utils import initial_board, board_to_tensor, game_over, result_from_perspective
+# ==========================
+# Пътища и глобални настройки
+# ==========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Твоите self-play и buffer (използваме ги директно)
-from training.buffer import ReplayBuffer as UserReplayBuffer  # това е буферът от training/buffer.py
+MODEL_PATH = os.path.join(BASE_DIR, "alpha_zero_supervised.pth")
+OPTIMIZER_PATH = os.path.join(BASE_DIR, "alpha_zero_supervised_opt.pth")
 
-# ensure headless pygame in workers (helps when pygame is imported elsewhere)
-os.environ["SDL_VIDEODRIVER"] = "dummy"
-
-# ---------- Multiprocessing configuration ----------
-NUM_PROCESSES = 4
-GAMES_PER_PROCESS = 1  # each worker plays 1 game per collection round
-SELFPLAY_SAVE_DIR = "training/rl/selfplay_data"
-LOG_DIR = "training/logs"
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+SELFPLAY_SAVE_DIR = os.path.join(BASE_DIR, "rl", "selfplay_data")
 STATS_CSV = os.path.join(LOG_DIR, "rl_stats.csv")
-WORKER_TIMEOUT_SEC = 5000  # per-worker watchdog (seconds) - adjust if you expect longer runs
 
-# silence noisy warnings in workers (keeps logs readable)
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(SELFPLAY_SAVE_DIR, exist_ok=True)
 
-# On some platforms we prefer spawn for multiprocessing safety with PyTorch
-# We'll only call set_start_method if it hasn't been set yet
-try:
-    mp.get_start_method()
-except RuntimeError:
+# multiprocessing настройки – могат да се override-нат от CLI
+NUM_PROCESSES = 2
+GAMES_PER_PROCESS = 1
+
+# Draw penalty (ако target_value == 0 от self-play → леко губещо)
+DRAW_VALUE_PENALTY = -0.15
+
+
+# ==========================
+# Worker функция за self-play
+# ==========================
+def _worker_self_play(
+    worker_id: int,
+    model_state_dict,
+    sims: int,
+    temperature: float,
+    games_per_worker: int,
+    queue,
+    device_str: str = "cpu",
+    verbose: bool = False,
+):
+    """
+    Един worker:
+    - зарежда CPU-safe state_dict
+    - качва модела на GPU (ако device_str == "cuda:X")
+    - играе games_per_worker self-play игри
+    - връща всички (s, pi, v) + статистики
+    """
     try:
-        mp.set_start_method("spawn")
-    except Exception:
-        # already set or platform doesn't allow
-        pass
+        # Определяме устройството
+        device = torch.device(device_str)
 
-# -----------------------
-# Local RL replay buffer (keeps examples across episodes)
-# -----------------------
-class ReplayBuffer:
-    """
-    This is the internal replay buffer used by the RL pipeline (keeps many episodes).
-    It stores tuples (state_tensor (C,H,W or H,W,C), policy_vector, value_scalar).
-    We only require: push(iterable) or extend, sample(batch_size) and __len__.
-    """
-    def __init__(self, capacity=200_000):
-        self.buffer = deque(maxlen=capacity)
+        # Ако worker-ът трябва да ползва GPU
+        if device_str.startswith("cuda"):
+            if ":" in device_str:
+                gpu_index = int(device_str.split(":")[1])
+            else:
+                gpu_index = 0
+            torch.cuda.set_device(gpu_index)
 
-    def push(self, examples):
-        # examples: iterable of (state, policy_vector, value) OR single triple
+        # Локален модел в worker-а
+        model = AlphaZeroModel().to(device)
+        model.load_state_dict(model_state_dict)  # dict е CPU-only → safe за pickle
+        model.eval()
+
+        total_examples = []
+        game_results = []
+        game_lengths = []
+
+        for game_idx in range(games_per_worker):
+            # Локален self-play буфер (малък, за текущата партия)
+            sp_buffer = ReplayBuffer(max_size=5000)
+
+            # Играем една self-play партия
+            result_str = play_episode(
+                model=model,
+                buffer=sp_buffer,
+                device=device,
+                simulations=sims,
+                base_temperature=temperature,
+                verbose=False,
+            )
+
+            # Вземаме (s, pi, v) от буфера
+            if hasattr(sp_buffer, "buffer"):
+                # training/replay_buffer.py използва self.buffer = []
+                examples = list(sp_buffer.buffer)
+            else:
+                examples = []
+
+            total_examples.extend(examples)
+            game_results.append(result_str)
+            game_lengths.append(len(examples))
+
+            if verbose:
+                print(
+                    f"[Worker {worker_id}] Game {game_idx + 1}/{games_per_worker} "
+                    f"→ result={result_str}, positions={len(examples)}"
+                )
+
+        # Връщаме резултат обратно в main процеса
+        queue.put(
+            {
+                "worker_id": worker_id,
+                "examples": total_examples,      # list of (state, policy_vector, value)
+                "game_results": game_results,    # list of result strings
+                "game_lengths": game_lengths,    # list of ints
+                "error": None,
+            }
+        )
+
+    except Exception as e:
+        queue.put(
+            {
+                "worker_id": worker_id,
+                "examples": [],
+                "game_results": [],
+                "game_lengths": [],
+                "error": f"{e}\n{traceback.format_exc()}",
+            }
+        )
+
+
+# ==========================
+# Основен RL Pipeline клас
+# ==========================
+class RLPipeline:
+    def __init__(
+        self,
+        model_path: str = MODEL_PATH,
+        optimizer_path: str = OPTIMIZER_PATH,
+        lr: float = 1e-4,
+        weight_decay: float = 1e-4,
+        buffer_capacity: int = 200_000,
+    ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Модел
+        self.model = AlphaZeroModel().to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        # Зареждане на модела (ако има)
+        if os.path.exists(model_path):
+            state = torch.load(model_path, map_location=self.device)
+            if isinstance(state, dict) and "state_dict" in state:
+                self.model.load_state_dict(state["state_dict"])
+            else:
+                self.model.load_state_dict(state)
+            self.log(f"[INFO] Loading model from {model_path}")
+        else:
+            self.log(f"[INFO] No existing model found at {model_path}. Starting from scratch.")
+
+        # Зареждане на оптимизатора (ако има)
+        if os.path.exists(optimizer_path):
+            opt_state = torch.load(optimizer_path, map_location=self.device)
+            try:
+                self.optimizer.load_state_dict(opt_state)
+                self.log(f"[INFO] Resumed optimizer from {optimizer_path}")
+            except Exception as e:
+                self.log(f"[WARN] Could not load optimizer state: {e}")
+        else:
+            self.log(f"[INFO] No optimizer state found at {optimizer_path}. Starting fresh optimizer.")
+
+        self.model_path = model_path
+        self.optimizer_path = optimizer_path
+
+        # RL Replay Buffer – използваме същия клас като за self-play,
+        # но с по-голям capacity
+        self.replay_buffer = ReplayBuffer(max_size=buffer_capacity)
+
+        # Лог файл
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = os.path.join(LOG_DIR, f"rl_training_{timestamp}.log")
+
+        # CSV за статистики
+        if not os.path.exists(STATS_CSV):
+            with open(STATS_CSV, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "timestamp",
+                        "episode",
+                        "collected_positions",
+                        "num_games",
+                        "avg_length",
+                        "draw_rate",
+                        "win_rate_white",
+                        "win_rate_black",
+                    ]
+                )
+
+    # ----------------- Logging helper -----------------
+    def log(self, msg: str):
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+        print(line)
         try:
-            first = next(iter(examples))
-            # iterable of tuples
-            self.buffer.extend(examples)
-        except TypeError:
-            # single tuple passed
-            self.buffer.append(examples)
-        except StopIteration:
-            # empty iterable
+            with open(self.log_file, "a") as f:
+                f.write(line + "\n")
+        except Exception:
             pass
 
-    def sample(self, batch_size):
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
-        if len(self.buffer) == 0:
-            raise ValueError("buffer empty")
-        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
-        states, policies, values = zip(*batch)
+    # ----------------- Model saving -----------------
+    def save_model(self, suffix: str = ""):
+        model_path = self.model_path if not suffix else self.model_path.replace(".pth", f"_{suffix}.pth")
+        opt_path = self.optimizer_path if not suffix else self.optimizer_path.replace(".pth", f"_{suffix}.pth")
 
-        # Convert states -> tensors, ensure channel-first (C,H,W)
-        states_t = []
+        state_dict = self.model.state_dict()
+        torch.save(state_dict, model_path)
+        torch.save(self.optimizer.state_dict(), opt_path)
+        self.log(f"[INFO] Model saved → {model_path}")
+
+    # ----------------- Self-play collection -----------------
+    def _collect_self_play_parallel(
+        self,
+        sims: int,
+        temperature: float,
+        processes: int,
+        games_per_worker: int,
+        verbose_workers: bool = False,
+    ):
+        """
+        Стартира паралелен self-play.
+        Връща:
+          - all_examples: list of (state, policy_vector, value)
+          - all_results: list of "1-0", "0-1", "1/2-1/2"
+          - all_lengths: list of game lengths (брой позиции)
+          - worker_errors: list of (worker_id, error_str)
+        """
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+
+        # CPU-only state_dict за безопасен pickle
+        raw_sd = self.model.state_dict()
+        model_state = {k: v.detach().cpu() for k, v in raw_sd.items()}
+
+        worker_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        procs = []
+        worker_errors = []
+
+        for wid in range(processes):
+            if worker_device.startswith("cuda"):
+                gpu_id = wid % torch.cuda.device_count()
+                device_str = f"cuda:{gpu_id}"
+            else:
+                device_str = "cpu"
+
+            p = ctx.Process(
+                target=_worker_self_play,
+                args=(
+                    wid,
+                    model_state,
+                    sims,
+                    temperature,
+                    games_per_worker,
+                    queue,
+                    device_str,
+                    verbose_workers,
+                ),
+            )
+            p.start()
+            procs.append(p)
+
+        all_examples = []
+        all_results = []
+        all_lengths = []
+
+        for _ in range(processes):
+            data = queue.get()
+
+            if data["error"]:
+                print(f"[PAR] Worker {data['worker_id']} error:")
+                print(data["error"])
+                worker_errors.append((data["worker_id"], data["error"]))
+                continue
+
+            all_examples.extend(data["examples"])
+            all_results.extend(data["game_results"])
+            all_lengths.extend(data["game_lengths"])
+
+            print(f"[PAR] Worker {data['worker_id']} returned {len(data['examples'])} positions.")
+
+        # Чистим worker процесите
+        for p in procs:
+            p.join(timeout=1.0)
+            if p.is_alive():
+                print(f"[PAR] Terminating unresponsive worker PID={p.pid}")
+                p.terminate()
+
+        return all_examples, all_results, all_lengths, worker_errors
+
+    # ----------------- RL Train step -----------------
+    def train_step(self, batch_size: int = 64):
+        """
+        Един training step върху replay_buffer.
+        Печата [TRAIN] и [DIAG] логове.
+        """
+        if len(self.replay_buffer) == 0:
+            self.log("[TRAIN] Not enough data. Replay buffer is empty.")
+            return None
+
+        states, policies, values = self.replay_buffer.sample(batch_size)
+        if states is None or len(states) == 0:
+            self.log("[TRAIN] Not enough data or sample() returned empty.")
+            return None
+
+        # States → тензор [B, C, H, W]
+        state_tensors = []
         for s in states:
             if isinstance(s, torch.Tensor):
                 st = s.detach().cpu().float()
             else:
                 st = torch.tensor(s, dtype=torch.float32)
-            # If HWC -> CHW (some of your utilities return (15,8,8) or (8,8,15))
+
+            # ако е (H,W,C) → (C,H,W)
             if st.ndim == 3 and st.shape[0] not in (1, 3, 15) and st.shape[-1] in (1, 3, 15):
                 st = st.permute(2, 0, 1)
-            if st.ndim == 3 and st.shape[0] not in (1, 3, 15) and st.shape[-1] == 15:
-                st = st.permute(2, 0, 1)
-            states_t.append(st)
 
-        # Convert policies -> tensors (assume full-length vectors)
-        policies_t = []
+            state_tensors.append(st)
+
+        states_tensor = torch.stack(state_tensors, dim=0).to(self.device)
+
+        # Policies → [B, 4672]
+        policy_tensors = []
         for p in policies:
             if isinstance(p, torch.Tensor):
-                policies_t.append(p.detach().cpu().float())
+                pt = p.detach().cpu().float()
             else:
-                policies_t.append(torch.tensor(p, dtype=torch.float32))
+                arr = np.array(p, dtype=np.float32)
+                pt = torch.from_numpy(arr)
+            policy_tensors.append(pt)
 
-        # Values: replace None with 0.0
-        values_t = torch.tensor([0.0 if (v is None) else float(v) for v in values], dtype=torch.float32).unsqueeze(1)
+        target_policies = torch.stack(policy_tensors, dim=0).to(self.device)
 
-        states_stack = torch.stack(states_t)
-        policies_stack = torch.stack(policies_t)
+        # Values → [B]
+        target_values = torch.tensor(
+            [0.0 if (v is None) else float(v) for v in values],
+            dtype=torch.float32,
+            device=self.device,
+        )
 
-        return states_stack, policies_stack, values_t
+        # Draw penalty shaping: ако target_value == 0 → леко negative
+        zero_mask = (target_values.abs() < 1e-6)
+        target_values[zero_mask] = DRAW_VALUE_PENALTY
 
-    def __len__(self):
-        return len(self.buffer)
-
-# -----------------------
-# Module-level worker function (picklable)
-# -----------------------
-def _worker_self_play(worker_id, model_state_dict, move_vector_size, sims, temperature, games_per_worker, queue, c_puct=None, verbose=False):
-    """
-    Each worker:
-     - creates a local AlphaZeroModel
-     - loads the given state_dict onto CPU
-     - creates a user ReplayBuffer (training.buffer.ReplayBuffer)
-     - calls play_episode(model, buffer, device=cpu, simulations=sims, temperature=temperature)
-       GAMES_PER_WORKER times
-     - extracts examples from buffer.buffer and returns them (plus metadata)
-    This function is designed to be picklable and robust: it posts a "started" message early
-    and posts "error" with traceback if anything fails.
-    """
-    try:
-        import torch as _torch
-        import traceback as _traceback
-    except Exception:
-        _torch = torch
-        _traceback = traceback
-
-    has_watchdog = False
-    try:
-        # watchdog (POSIX). If platform doesn't support SIGALRM (Windows), skip.
-        try:
-            def _alarm_handler(signum, frame):
-                raise TimeoutError(f"Worker {worker_id} watchdog timeout after {WORKER_TIMEOUT_SEC}s")
-            signal.signal(signal.SIGALRM, _alarm_handler)
-            signal.alarm(WORKER_TIMEOUT_SEC)
-            has_watchdog = True
-        except Exception:
-            has_watchdog = False
-
-        # Early alive signal so parent knows this worker started
-        try:
-            queue.put({"worker_id": worker_id, "status": "started"})
-        except Exception:
-            pass
-
-        # local model (CPU)
-        model = AlphaZeroModel()
-        # Load safe: try to convert state tensors to cpu
-        try:
-            cpu_state = {k: v.cpu() for k, v in model_state_dict.items()}
-            model.load_state_dict(cpu_state)
-        except Exception:
-            try:
-                model.load_state_dict(model_state_dict)
-            except Exception as e:
-                tb = _traceback.format_exc()
-                try:
-                    queue.put({"worker_id": worker_id, "error": f"Failed to load state_dict in worker: {e}\n{tb}"})
-                except Exception:
-                    print(f"[Worker {worker_id}] Failed to report load error: {e}\n{tb}")
-                return
-
-        model.to(_torch.device("cpu"))
-        model.eval()
-
-        collected_examples = []
-        game_results = []
-        game_lengths = []
-
-        # run games
-        for g in range(games_per_worker):
-            user_buffer = UserReplayBuffer()  # training/buffer.ReplayBuffer()
-            try:
-                # run self-play: note play_episode uses MCTS internally; it's CPU-only here
-                result_str = play_episode(model=model, buffer=user_buffer, device=_torch.device("cpu"),
-                                          simulations=sims, temperature=temperature, verbose=verbose)
-            except Exception as e:
-                tb = _traceback.format_exc()
-                try:
-                    queue.put({"worker_id": worker_id, "error": f"play_episode crashed in worker: {e}\n{tb}"})
-                except Exception:
-                    print(f"[Worker {worker_id}] Failed to report play_episode error: {e}\n{tb}")
-                return
-
-            # collect examples from user_buffer.buffer
-            for (s, p, v) in list(user_buffer.buffer):
-                if isinstance(s, np.ndarray):
-                    s_t = _torch.tensor(s, dtype=_torch.float32)
-                else:
-                    s_t = s if isinstance(s, _torch.Tensor) else _torch.tensor(s, dtype=_torch.float32)
-                p_t = p if isinstance(p, _torch.Tensor) else _torch.tensor(p, dtype=_torch.float32)
-                s_t = s_t.detach().cpu()
-                p_t = p_t.detach().cpu()
-
-                # --- VALUE conversion (PATCH) ---
-                # play_episode() now stores values already "from side-to-move perspective"
-                # i.e. value = +1 if the player to move in that state eventually wins,
-                # value = -1 if that player eventually loses, value = 0 for draw.
-                # Therefore DO NOT re-run result_from_perspective on v; prefer direct float conversion.
-                if v is None:
-                    v_f = 0.0
-                else:
-                    try:
-                        v_f = float(v)
-                    except Exception:
-                        try:
-                            v_f = result_from_perspective(v)
-                        except Exception:
-                            v_f = 0.0
-
-                collected_examples.append((s_t, p_t, v_f))
-
-            # derive simple metadata: game result & length (if available)
-            gr = 0
-            if result_str == "1-0":
-                gr = 1
-            elif result_str == "0-1":
-                gr = -1
-            else:
-                gr = 0
-            game_results.append(gr)
-            game_lengths.append(len(user_buffer.buffer))
-
-        # Cancel alarm before returning
-        try:
-            if has_watchdog:
-                signal.alarm(0)
-        except Exception:
-            pass
-
-        # final "done" message with examples
-        try:
-            # --- write examples to a temporary file and send path over queue ---
-            try:
-                tmpf = tempfile.NamedTemporaryFile(prefix=f"worker_{worker_id}_", suffix=".pt", delete=False)
-                tmp_path = tmpf.name
-                tmpf.close()
-            except Exception:
-                tmp_path = os.path.join(tempfile.gettempdir(), f"worker_{worker_id}_examples.pt")
-
-            try:
-                _torch.save({"examples": collected_examples}, tmp_path)
-            except Exception:
-                # fallback: convert to numpy arrays for robust pickle
-                serializable = []
-                for (s, p, v) in collected_examples:
-                    s_numpy = s.detach().cpu().numpy() if isinstance(s, _torch.Tensor) else np.array(s)
-                    p_numpy = p.detach().cpu().numpy() if isinstance(p, _torch.Tensor) else np.array(p)
-                    serializable.append((s_numpy, p_numpy, v))
-                _torch.save({"examples": serializable}, tmp_path)
-
-            queue.put({
-                "worker_id": worker_id,
-                "examples_file": tmp_path,
-                "game_results": game_results,
-                "game_lengths": game_lengths,
-                "count": len(collected_examples),
-                "status": "done"
-            })
-        except Exception as e:
-            tb = _traceback.format_exc()
-            print(f"[Worker {worker_id}] Failed to put final result to queue: {e}\n{tb}")
-            try:
-                queue.put({"worker_id": worker_id, "error": f"final queue.put failed: {e}\n{tb}"})
-            except Exception:
-                print(f"[Worker {worker_id}] Also failed to report final failure.")
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        try:
-            queue.put({"worker_id": worker_id, "error": f"{str(e)}\n{tb}"})
-        except Exception:
-            print(f"[Worker {worker_id}] Fatal error and failed to report to queue: {e}\n{tb}")
-    finally:
-        try:
-            if has_watchdog:
-                signal.alarm(0)
-        except Exception:
-            pass
-
-# -----------------------
-# RL pipeline
-# -----------------------
-class RLPipeline:
-    def __init__(self,
-                 model_path="/home/presi/projects/chess_ai_project/training/alpha_zero_supervised.pth",
-                 device=None,
-                 lr=1e-4,
-                 weight_decay=1e-4,
-                 buffer_capacity=200_000,
-                 move_vector_size=4672,
-                 log_dir=LOG_DIR):
-        # device selection: allow string or torch.device
-        if isinstance(device, str):
-            self.device = torch.device(device)
-        else:
-            self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-
-        self.model = AlphaZeroModel().to(self.device)
-        # lower lr by default for stability in RL pipeline
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        # keep CrossEntropyLoss object for compatibility (not used for distributional)
-        self.policy_loss_fn = nn.CrossEntropyLoss()
-        self.value_loss_fn = nn.MSELoss()
-
-        self.buffer = ReplayBuffer(capacity=buffer_capacity)
-        self.model_path = model_path
-        self.move_vector_size = move_vector_size
-
-        # logging setup
-        os.makedirs(log_dir, exist_ok=True)
-        now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.log_file = os.path.join(log_dir, f"rl_training_{now}.log")
-
-        # ensure selfplay save dir exists
-        os.makedirs(SELFPLAY_SAVE_DIR, exist_ok=True)
-
-        # ensure stats csv exists (with header)
-        if not os.path.exists(STATS_CSV):
-            try:
-                with open(STATS_CSV, "w", newline="", encoding="utf-8") as cf:
-                    writer = csv.writer(cf)
-                    writer.writerow(["timestamp", "episode", "total_positions", "games", "avg_game_length", "white_rate", "black_rate", "draw_rate", "mean_loss"])
-            except Exception:
-                pass
-
-        # Safe load of model
-        if os.path.exists(self.model_path):
-            print(f"[INFO] Loading existing model from {self.model_path}")
-            try:
-                state = torch.load(self.model_path, map_location=self.device)
-                try:
-                    self.model.load_state_dict(state)
-                except Exception:
-                    # fallback: be permissive if architecture changed slightly
-                    self.model.load_state_dict(state, strict=False)
-            except Exception as e:
-                print(f"[WARN] Failed to load model state_dict cleanly: {e}")
-        else:
-            print("[INFO] Starting with new model.")
-
-        # Try resume optimizer state if there is one
-        try:
-            opt_path = self.model_path.replace(".pth", "_opt.pth")
-            if os.path.exists(opt_path):
-                try:
-                    self.optimizer.load_state_dict(torch.load(opt_path, map_location=self.device))
-                    print(f"[INFO] Resumed optimizer state from {opt_path}")
-                except Exception:
-                    print(f"[WARN] Could not load optimizer state from {opt_path}")
-        except Exception:
-            pass
-
-    # defensive wrapper for move_to_index (some implementations expect (move) others (move, board))
-    def _move_to_index(self, move, board):
-        try:
-            idx = move_to_index(move)
-            return idx
-        except TypeError:
-            try:
-                idx = move_to_index(move, board)
-                return idx
-            except Exception:
-                return None
-        except Exception:
-            return None
-
-    # defensive wrapper for index_to_move (some variants may need board)
-    def _index_to_move(self, index, board):
-        try:
-            mv = index_to_move(index)
-            if mv is None:
-                # try variant with board
-                try:
-                    mv = index_to_move(index, board)
-                except Exception:
-                    mv = None
-            return mv
-        except TypeError:
-            try:
-                mv = index_to_move(index, board)
-                return mv
-            except Exception:
-                return None
-        except Exception:
-            return None
-
-    def self_play_episode(self, mcts_sims=100, temperature=1.0, verbose=False):
-        """
-        Single-process self-play (kept for debug/fallback).
-        Returns examples list of (state_tensor [C,H,W], pi_tensor [move_dim], z scalar)
-        and move_logs for debugging.
-        """
-        user_buffer = UserReplayBuffer()
-        try:
-            result_str = play_episode(model=self.model, buffer=user_buffer, device=self.device,
-                                      simulations=mcts_sims, temperature=temperature, verbose=verbose)
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.log(f"[SELF-PLAY-ERR] play_episode failed: {e}\n{tb}")
-            return [], []
-
-        examples = []
-        for (s, p, v) in list(user_buffer.buffer):
-            # ensure tensors
-            s_t = s if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32)
-            p_t = p if isinstance(p, torch.Tensor) else torch.tensor(p, dtype=torch.float32)
-            v_f = 0.0 if v is None else float(v)
-            examples.append((s_t, p_t, v_f))
-
-        logs = {"result": result_str, "count": len(examples)}
-        return examples, logs
-
-    def add_examples(self, examples):
-        self.buffer.push(examples)
-
-    def _collect_self_play_parallel(self, num_processes=NUM_PROCESSES, games_per_worker=GAMES_PER_PROCESS, sims=50, temperature=1.0, timeout=WORKER_TIMEOUT_SEC):
-        """
-        Launch workers which call play_episode() and return user buffer contents.
-        """
-        ctx = mp.get_context("spawn")
-        queue = ctx.Queue()
-        processes = []
-        # send state_dict (CPU) to workers
-        model_state_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
-
-        # paths for simple diagnostics (in case of debug saving)
-        started_workers = 0
-        initial_results = []
-
-        for i in range(num_processes):
-            p = ctx.Process(target=_worker_self_play,
-                            args=(i, model_state_dict, self.move_vector_size, sims, temperature, games_per_worker, queue, None, False))
-            p.start()
-            processes.append(p)
-
-        combined = []
-        all_game_results = []
-        all_game_lengths = []
-        worker_errors = []
-        start_time = time.time()
-
-        # Wait shortly for workers to announce "started" (diagnostic)
-        start_deadline = time.time() + min(10.0, timeout)
-        while time.time() < start_deadline and started_workers < num_processes:
-            try:
-                msg = queue.get(timeout=0.5)
-                if isinstance(msg, dict) and msg.get("status") == "started":
-                    started_workers += 1
-                    self.log(f"[PAR] Worker {msg.get('worker_id')} started.")
-                else:
-                    # accumulate for later processing
-                    initial_results.append(msg)
-            except Exception:
-                # nothing ready yet
-                pass
-
-        # process any initial_results we got while waiting for starts
-        for msg in initial_results:
-            if not isinstance(msg, dict):
-                continue
-            if "error" in msg:
-                worker_errors.append(msg)
-                self.log(f"[PAR] Worker {msg.get('worker_id')} error (early): {msg.get('error')}")
-            elif msg.get("status") == "done":
-                # support both legacy 'examples' and new 'examples_file'
-                if msg.get("examples_file"):
-                    try:
-                        data = torch.load(msg.get("examples_file"))
-                        exs = data.get("examples", [])
-                        # if saved as numpy arrays, convert to tensors
-                        safe_exs = []
-                        for (s, p, v) in exs:
-                            s_t = torch.tensor(s, dtype=torch.float32) if not isinstance(s, torch.Tensor) else s.detach().cpu()
-                            p_t = torch.tensor(p, dtype=torch.float32) if not isinstance(p, torch.Tensor) else p.detach().cpu()
-                            # PATCH: tolerant value conversion
-                            try:
-                                v_f = 0.0 if v is None else float(v)
-                            except Exception:
-                                try:
-                                    v_f = result_from_perspective(v)
-                                except Exception:
-                                    v_f = 0.0
-                            safe_exs.append((s_t, p_t, v_f))
-                        combined.extend(safe_exs)
-                        # try to cleanup file
-                        try:
-                            os.remove(msg.get("examples_file"))
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        worker_errors.append({"worker_id": msg.get("worker_id"), "error": f"failed to load examples_file early: {e}"})
-                else:
-                    exs = msg.get("examples", [])
-                    combined.extend(exs)
-                try:
-                    count_len = msg.get("count", len(exs) if 'exs' in locals() else 0)
-                except Exception:
-                    count_len = 0
-                self.log(f"[PAR] (early) Worker {msg.get('worker_id')} returned {count_len} positions.")
-                all_game_results.extend(msg.get("game_results", []))
-                all_game_lengths.extend(msg.get("game_lengths", []))
-
-        # Now collect up to num_processes results, with timeout
-        for _ in range(num_processes):
-            try:
-                res = queue.get(timeout=timeout)
-            except Exception:
-                res = {"worker_id": None, "error": "timeout waiting for worker"}
-            if "error" in res:
-                worker_errors.append(res)
-                self.log(f"[PAR] Worker {res.get('worker_id')} error: {res.get('error')}")
-            else:
-                # support both legacy 'examples' and new 'examples_file'
-                examples = []
-                if res.get("examples_file"):
-                    fpath = res.get("examples_file")
-                    try:
-                        data = torch.load(fpath)
-                        exs = data.get("examples", [])
-                        for (s, p, v) in exs:
-                            # convert numpy back to tensor if needed
-                            if isinstance(s, np.ndarray):
-                                s_cpu = torch.tensor(s, dtype=torch.float32)
-                            elif isinstance(s, torch.Tensor):
-                                s_cpu = s.detach().cpu()
-                            else:
-                                s_cpu = torch.tensor(s, dtype=torch.float32)
-                            if isinstance(p, np.ndarray):
-                                p_cpu = torch.tensor(p, dtype=torch.float32)
-                            elif isinstance(p, torch.Tensor):
-                                p_cpu = p.detach().cpu()
-                            else:
-                                p_cpu = torch.tensor(p, dtype=torch.float32)
-                            # PATCH: tolerant value conversion
-                            try:
-                                v_f = 0.0 if v is None else float(v)
-                            except Exception:
-                                try:
-                                    v_f = result_from_perspective(v)
-                                except Exception:
-                                    v_f = 0.0
-                            examples.append((s_cpu, p_cpu, v_f))
-                        # cleanup temp file
-                        try:
-                            os.remove(fpath)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        worker_errors.append({"worker_id": res.get("worker_id"), "error": f"failed to load examples_file: {e}"})
-                else:
-                    examples = res.get("examples", [])
-
-                # ensure all tensors are cpu detached (legacy branch)
-                safe_examples = []
-                for (s, p, v) in examples:
-                    try:
-                        s_cpu = s.detach().cpu() if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32)
-                    except Exception:
-                        s_cpu = torch.tensor(s, dtype=torch.float32)
-                    try:
-                        p_cpu = p.detach().cpu() if isinstance(p, torch.Tensor) else torch.tensor(p, dtype=torch.float32)
-                    except Exception:
-                        p_cpu = torch.tensor(p, dtype=torch.float32)
-                    v_f = 0.0 if v is None else float(v)
-                    safe_examples.append((s_cpu, p_cpu, v_f))
-
-                combined.extend(safe_examples)
-                self.log(f"[PAR] Worker {res.get('worker_id')} returned {res.get('count', len(safe_examples))} positions.")
-                game_res = res.get("game_results", [])
-                game_len = res.get("game_lengths", [])
-                all_game_results.extend(game_res)
-                all_game_lengths.extend(game_len)
-
-        # join and force-terminate if any remain alive
-        for p in processes:
-            p.join(timeout=1.0)
-        for p in processes:
-            if p.is_alive():
-                try:
-                    self.log(f"[PAR] Terminating unresponsive worker PID={p.pid}")
-                    p.terminate()
-                    p.join(timeout=1.0)
-                except Exception as e:
-                    self.log(f"[PAR] Failed to terminate worker PID={getattr(p, 'pid', 'unknown')}: {e}")
-
-        elapsed = time.time() - start_time
-        self.log(f"[PAR] Collected total {len(combined)} positions from {num_processes} workers in {elapsed:.1f}s")
-        if worker_errors:
-            self.log(f"[PAR] {len(worker_errors)} workers reported errors; check earlier logs.")
-        return combined, all_game_results, all_game_lengths
-
-    def train_step(self, batch_size=64):
-        """
-        Train one gradient step on sampled batch.
-        Uses distributional cross-entropy for policy (learn full pi distribution),
-        and MSE for value head.
-        Returns stats dict or None if not enough data.
-        """
-        if len(self.buffer) < batch_size:
-            return None
-
-        states, policies, values = self.buffer.sample(batch_size)
-        states = states.to(self.device)
-        policies = policies.to(self.device)   # expected shape (B, move_dim), sum to 1
-        values = values.to(self.device)       # shape (B,1)
-
-        # PATCH: diagnostic on batch value distribution (helps verify non-zero targets)
-        try:
-            with torch.no_grad():
-                vals_cpu = values.squeeze(1).cpu().numpy()
-                neg = (vals_cpu < -0.5).sum()
-                zero = ((vals_cpu >= -0.5) & (vals_cpu <= 0.5)).sum()
-                pos = (vals_cpu > 0.5).sum()
-                self.log(f"[DIAG] Batch values -> pos:{int(pos)} zero:{int(zero)} neg:{int(neg)} (batch {len(vals_cpu)})")
-        except Exception:
-            pass
-
+        # Forward
         self.model.train()
-        out_policy, out_value = self.model(states)  # out_policy: logits (B, move_dim), out_value: (B,1) or (B,)
+        out_policy, out_value = self.model(states_tensor)  # out_policy: [B,4672], out_value: [B,1]
 
-        # === Policy loss: distributional cross-entropy ===
-        # numerical safety: clamp logits to avoid extreme exponentials
-        out_policy = torch.clamp(out_policy, -20.0, 20.0)
-        log_probs = torch.log_softmax(out_policy, dim=1)
-        loss_p = -(policies * log_probs).sum(dim=1).mean()
+        out_value = out_value.view(-1)  # [B]
 
-        # === Value loss ===
-        loss_v = self.value_loss_fn(out_value, values)
+        log_probs = F.log_softmax(out_policy, dim=1)
+        # Policy loss (soft targets cross-entropy)
+        policy_loss = -torch.mean(torch.sum(target_policies * log_probs, dim=1))
 
-        loss = loss_p + loss_v
+        # Value loss (MSE)
+        value_loss = F.mse_loss(out_value, target_values)
 
-        # safety: skip if invalid numerics
-        if not torch.isfinite(loss):
-            self.log("[WARN] Non-finite loss detected, skipping update.")
-            return None
+        loss = policy_loss + value_loss
 
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), 2.0)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
         self.optimizer.step()
 
-        # logging stats: accuracy proxy (argmax against distribution peak)
+        # Accuracy: argmax на policy
         with torch.no_grad():
-            pred_moves = torch.argmax(out_policy, dim=1)
-            true_moves = torch.argmax(policies, dim=1)
-            acc = (pred_moves == true_moves).float().mean().item()
+            pred_idx = out_policy.argmax(dim=1)
+            target_idx = target_policies.argmax(dim=1)
+            correct = (pred_idx == target_idx).float()
+            acc = correct.mean().item()
 
-        return {"loss": loss.item(), "loss_p": loss_p.item(), "loss_v": loss_v.item(), "acc": acc, "batch": batch_size}
+            vals_cpu = target_values.detach().cpu().numpy()
+            neg = (vals_cpu < -0.5).sum()
+            zero = ((vals_cpu >= -0.5) & (vals_cpu <= 0.5)).sum()
+            pos = (vals_cpu > 0.5).sum()
 
-    def save_model(self, suffix="latest"):
-        os.makedirs(os.path.dirname(self.model_path) or ".", exist_ok=True)
-        base, ext = os.path.splitext(self.model_path)
-        save_path = f"{base}_{suffix}{ext}"
-        try:
-            torch.save(self.model.state_dict(), save_path)
-            # also persist canonical path
-            torch.save(self.model.state_dict(), self.model_path)
-            # also save optimizer for resume
-            try:
-                opt_path = self.model_path.replace(".pth", "_opt.pth")
-                torch.save(self.optimizer.state_dict(), opt_path)
-            except Exception as e:
-                self.log(f"[WARN] Could not save optimizer state: {e}")
-            self.log(f"[INFO] Model saved ({suffix}) → {save_path}")
-        except Exception as e:
-            self.log(f"[ERROR] Failed to save model: {e}")
+        stats = {
+            "loss": loss.item(),
+            "policy_loss": policy_loss.item(),
+            "value_loss": value_loss.item(),
+            "acc": acc,
+            "batch": len(states),
+            "pos": int(pos),
+            "zero": int(zero),
+            "neg": int(neg),
+        }
 
-    def _save_selfplay_batch(self, examples):
-        """
-        Save a collected batch of self-play examples to disk for future analysis / replay.
-        examples: list of (state_tensor, policy_tensor, value)
-        """
-        try:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            fname = os.path.join(SELFPLAY_SAVE_DIR, f"episode_{ts}.pt")
-            torch.save({"examples": examples}, fname)
-            self.log(f"[IO] Saved self-play batch ({len(examples)} positions) -> {fname}")
-        except Exception as e:
-            self.log(f"[IO-ERR] Failed saving self-play batch: {e}")
+        return stats
 
-    def _append_stats_csv(self, episode, total_positions, games, avg_game_length, white_rate, black_rate, draw_rate, mean_loss):
-        try:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(STATS_CSV, "a", newline="", encoding="utf-8") as cf:
-                writer = csv.writer(cf)
-                writer.writerow([ts, episode, total_positions, games, avg_game_length, white_rate, black_rate, draw_rate, mean_loss])
-        except Exception:
-            pass
-
-    def log(self, msg):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"{ts} {msg}"
-        print(line)
-        try:
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-
-    def run_training(self, episodes=50, train_steps=20, batch_size=64, sims=300, temperature=1.0, verbose=False, collect_in_parallel=True):
-        """
-        Главен RL loop: for ep -> parallel self-play collection -> add to buffer -> some train steps -> checkpoint
-
-        По подразбиране sims=300 (повече симулации за по-качествени self-play партии в началото).
-        """
+    # ----------------- Главен RL цикъл -----------------
+    def run_training(
+        self,
+        episodes: int = 10,
+        train_steps: int = 20,
+        batch_size: int = 64,
+        sims: int = 200,
+        temperature: float = 1.0,
+        num_processes: int = NUM_PROCESSES,
+        games_per_worker: int = GAMES_PER_PROCESS,
+    ):
         self.log(f"[RL] Starting training for {episodes} episodes...")
-        avg_losses = []
 
-        try:
-            for ep in range(1, episodes + 1):
-                self.log(f"\n[EP {ep}] Collecting self-play data...")
-                if collect_in_parallel:
-                    collected, game_results, game_lengths = self._collect_self_play_parallel(num_processes=NUM_PROCESSES,
-                                                                                            games_per_worker=GAMES_PER_PROCESS,
-                                                                                            sims=sims,
-                                                                                            temperature=temperature)
-                else:
-                    examples, logs = self.self_play_episode(mcts_sims=sims, temperature=temperature, verbose=verbose)
-                    collected = examples
-                    game_results = []
-                    game_lengths = []
-                    if collected:
-                        game_lengths = [len(collected)]
+        for ep in range(1, episodes + 1):
+            self.log(f"\n[EP {ep}] Collecting self-play data...")
 
-                # add to global buffer and save raw batch
-                if collected:
-                    self.add_examples(collected)
-                    self._save_selfplay_batch(collected)
-                    self.log(f"[EP {ep}] Collected {len(collected)} examples (Buffer size: {len(self.buffer)})")
-                else:
-                    self.log(f"[EP {ep}] No examples collected this round.")
+            start_time = time.time()
+            examples, game_results, game_lengths, errors = self._collect_self_play_parallel(
+                processes=num_processes,
+                games_per_worker=games_per_worker,
+                sims=sims,
+                temperature=temperature,
+                verbose_workers=False,
+            )
+            elapsed = time.time() - start_time
 
-                # compute aggregated stats
-                total_positions = len(collected)
-                games = len(game_lengths) if game_lengths else 0
-                avg_game_length = float(np.mean(game_lengths)) if game_lengths else 0.0
-                white_rate = black_rate = draw_rate = 0.0
-                if game_results:
-                    total_games = len(game_results)
-                    white_rate = 100.0 * sum(1 for r in game_results if r == 1) / total_games
-                    black_rate = 100.0 * sum(1 for r in game_results if r == -1) / total_games
-                    draw_rate = 100.0 * sum(1 for r in game_results if r == 0) / total_games
-                    self.log(f"[STATS] Games:{total_games} Len_avg:{avg_game_length:.2f} White:{white_rate:.1f}% Black:{black_rate:.1f}% Draw:{draw_rate:.1f}%")
-                else:
-                    self.log(f"[STATS] Collected positions: {total_positions} (no per-game metadata available)")
+            if errors:
+                self.log(f"[EP {ep}] Some workers reported errors (see above).")
 
-                self._append_stats_csv(ep, total_positions, games, avg_game_length, white_rate, black_rate, draw_rate, mean_loss=0.0)
+            if not examples:
+                self.log(f"[EP {ep}] No examples collected this round.")
+            else:
+                # Добавяме в RL буфера – примерите са (s, pi, v)
+                for (s, p, v) in examples:
+                    self.replay_buffer.push(s, p, v)
 
-                # training
-                for step in range(train_steps):
-                    stats = self.train_step(batch_size)
-                    if stats:
-                        self.log(f"[TRAIN] Step {step+1}/{train_steps} | Loss={stats['loss']:.4f} | "
-                                 f"Policy={stats['loss_p']:.4f} | Value={stats['loss_v']:.4f} | Acc={stats['acc']*100:.2f}%")
-                        avg_losses.append(stats['loss'])
-                    else:
-                        self.log("[TRAIN] Not enough data or NaN loss.")
+                self.log(
+                    f"[EP {ep}] Collected {len(examples)} examples "
+                    f"(ReplayBuffer size: {len(self.replay_buffer)}) in {elapsed:.1f}s"
+                )
 
-                # after training steps, update mean_loss in CSV last row manually (simple append marker)
-                if avg_losses:
-                    mean_loss = float(np.mean(avg_losses[-max(len(avg_losses), 1):]))
-                else:
-                    mean_loss = 0.0
-                # Append a new CSV row with updated mean_loss for this episode (so there is a row with loss)
-                self._append_stats_csv(ep, total_positions, games, avg_game_length, white_rate, black_rate, draw_rate, mean_loss)
+            # Статистика за игрите
+            num_games = len(game_results)
+            if num_games > 0:
+                lengths = [l for l in game_lengths if l is not None]
+                avg_len = float(np.mean(lengths)) if lengths else 0.0
 
-                # periodic saving
-                if ep % 5 == 0:
-                    self.save_model(suffix=f"ep{ep}")
+                draws = sum(1 for r in game_results if r == "1/2-1/2")
+                whites = sum(1 for r in game_results if r == "1-0")
+                blacks = sum(1 for r in game_results if r == "0-1")
 
-            # final save
-            self.save_model(suffix="final")
-            self.log("[RL] Training complete!")
+                draw_rate = draws / num_games
+                win_white = whites / num_games
+                win_black = blacks / num_games
 
-        except KeyboardInterrupt:
-            self.log("[INTERRUPT] Training stopped manually. Saving checkpoint...")
-            self.save_model(suffix="interrupted")
-            try:
-                opt_path = self.model_path.replace(".pth", "_opt.pth")
-                torch.save(self.optimizer.state_dict(), opt_path)
-                self.log(f"[INTERRUPT] Optimizer checkpoint saved → {opt_path}")
-            except Exception:
-                pass
+                self.log(
+                    f"[STATS] Games: {num_games} | Avg length: {avg_len:.1f} | "
+                    f"Draws: {draws} ({draw_rate*100:.1f}%) | "
+                    f"White wins: {whites} ({win_white*100:.1f}%) | "
+                    f"Black wins: {blacks} ({win_black*100:.1f}%)"
+                )
 
-        # final stats
-        if avg_losses:
-            try:
-                self.log(f"[STATS] Mean loss: {np.mean(avg_losses):.4f} over {len(avg_losses)} recorded train steps")
-            except Exception:
-                pass
+                # Запис в CSV
+                with open(STATS_CSV, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        [
+                            datetime.now().isoformat(),
+                            ep,
+                            len(examples),
+                            num_games,
+                            avg_len,
+                            draw_rate,
+                            win_white,
+                            win_black,
+                        ]
+                    )
+            else:
+                self.log("[STATS] No games played this episode.")
 
-# -----------------------
-# quick run when executed directly
-# -----------------------
+            # -------- TRAINING --------
+            for step in range(train_steps):
+                stats = self.train_step(batch_size=batch_size)
+                if stats is None:
+                    self.log("[TRAIN] Not enough data or NaN loss.")
+                    break
+
+                self.log(
+                    f"[TRAIN] Step {step+1}/{train_steps} | "
+                    f"Loss={stats['loss']:.4f} | "
+                    f"Policy={stats['policy_loss']:.4f} | "
+                    f"Value={stats['value_loss']:.4f} | "
+                    f"Acc={stats['acc']*100:.2f}%"
+                )
+                self.log(
+                    f"[DIAG] Batch values -> pos:{stats['pos']} "
+                    f"zero:{stats['zero']} neg:{stats['neg']} (batch {stats['batch']})"
+                )
+
+            # Запис на модела след епизода
+            self.save_model(suffix=f"ep{ep}")
+
+        # Финален save
+        self.save_model(suffix="final")
+        self.log("[RL] Training complete!")
+
+
+# ==========================
+# CLI launcher
+# ==========================
 if __name__ == "__main__":
-    pipeline = RLPipeline(
-        model_path="/home/presi/projects/chess_ai_project/training/alpha_zero_supervised.pth",
-        move_vector_size=4672  # adjust if your move encoding differs
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run AlphaZero RL Training Pipeline")
+
+    parser.add_argument("--episodes", type=int, default=20, help="Number of RL episodes (self-play + training)")
+    parser.add_argument("--train_steps", type=int, default=15, help="Gradient steps per episode")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--sims", type=int, default=40, help="MCTS simulations per move")
+    parser.add_argument("--temperature", type=float, default=1.50, help="Root sampling temperature")
+    parser.add_argument("--processes", type=int, default=NUM_PROCESSES, help="Number of self-play worker processes")
+    parser.add_argument(
+        "--games_per_worker", type=int, default=GAMES_PER_PROCESS, help="Number of games per worker per episode"
     )
-    # default sims set higher for better self-play examples
-    pipeline.run_training(episodes=70, train_steps=15, batch_size=64, sims=400, verbose=True)
+
+    args = parser.parse_args()
+
+    pipeline = RLPipeline()
+
+    print("=======================================")
+    print("🚀 Starting AlphaZero RL Training...")
+    print(f" Episodes     : {args.episodes}")
+    print(f" Train Steps  : {args.train_steps}")
+    print(f" Batch Size   : {args.batch_size}")
+    print(f" MCTS Sims    : {args.sims}")
+    print(f" Temperature  : {args.temperature}")
+    print(f" Processes    : {args.processes}")
+    print(f" Games/Worker : {args.games_per_worker}")
+    print("=======================================")
+
+    pipeline.run_training(
+        episodes=args.episodes,
+        train_steps=args.train_steps,
+        batch_size=args.batch_size,
+        sims=args.sims,
+        temperature=args.temperature,
+        num_processes=args.processes,
+        games_per_worker=args.games_per_worker,
+    )
+
+    print("=======================================")
+    print("🎉 Training Completed Successfully")
+    print("=======================================")

@@ -6,7 +6,7 @@ from pathlib import Path
 import torch.nn.functional as F
 
 from models.AlphaZero import AlphaZeroModel
-from training.move_encoding import index_to_move
+from models.move_encoding import index_to_move
 
 
 class ChessLabeledTensorDataset(Dataset):

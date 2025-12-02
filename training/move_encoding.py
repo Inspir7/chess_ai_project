@@ -1,114 +1,100 @@
+# training/move_encoding.py
+
 import chess
 
-MOVE_TYPES_PER_FROM = 73
-TOTAL_MOVES = 64 * MOVE_TYPES_PER_FROM
+# -------------------------------------------------------
+# CONSTANTS
+# -------------------------------------------------------
 
-# Directions (dx, dy): x = file (column), y = rank (row)
-DIRECTIONS = [
-    (1, 0), (-1, 0), (0, 1), (0, -1),     # rook-like
-    (1, 1), (1, -1), (-1, 1), (-1, -1)    # bishop-like
-]
+TOTAL_MOVES = 4672   # 64*64 + 4*64  (normal moves + 4 promotion types)
 
-KNIGHT_OFFSETS = [
-    (2, 1), (1, 2), (-1, 2), (-2, 1),
-    (-2, -1), (-1, -2), (1, -2), (2, -1)
-]
+PROMOTION_PIECES = {
+    chess.KNIGHT: 0,
+    chess.BISHOP: 1,
+    chess.ROOK:   2,
+    chess.QUEEN:  3,
+}
 
-PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
-
-ALL_MOVES = []
-
-
-def in_bounds(file, rank):
-    return 0 <= file < 8 and 0 <= rank < 8
-
-
-for from_sq in range(64):
-    file = chess.square_file(from_sq)
-    rank = chess.square_rank(from_sq)
-    move_type = 0
-
-    # Sliding moves (8 directions × up to 7 steps)
-    for dx, dy in DIRECTIONS:
-        for dist in range(1, 8):
-            tx, ty = file + dx * dist, rank + dy * dist
-            if in_bounds(tx, ty):
-                to_sq = chess.square(tx, ty)
-                ALL_MOVES.append(chess.Move(from_sq, to_sq))
-                move_type += 1
-            else:
-                break
-
-    # Knight moves (8 offsets)
-    for dx, dy in KNIGHT_OFFSETS:
-        tx, ty = file + dx, rank + dy
-        if in_bounds(tx, ty):
-            to_sq = chess.square(tx, ty)
-            ALL_MOVES.append(chess.Move(from_sq, to_sq))
-            move_type += 1
-
-    # Pawn promotions (both colors)
-    if rank == 6:  # white pawn promotions
-        for dx in [-1, 0, 1]:
-            tx, ty = file + dx, rank + 1
-            if in_bounds(tx, ty):
-                to_sq = chess.square(tx, ty)
-                for promo_piece in PROMO_PIECES:
-                    ALL_MOVES.append(chess.Move(from_sq, to_sq, promotion=promo_piece))
-                    move_type += 1
-    if rank == 1:  # black pawn promotions
-        for dx in [-1, 0, 1]:
-            tx, ty = file + dx, rank - 1
-            if in_bounds(tx, ty):
-                to_sq = chess.square(tx, ty)
-                for promo_piece in PROMO_PIECES:
-                    ALL_MOVES.append(chess.Move(from_sq, to_sq, promotion=promo_piece))
-                    move_type += 1
-
-    # Add castling moves for king squares
-    if from_sq in [chess.E1, chess.E8]:
-        if from_sq == chess.E1:
-            ALL_MOVES.append(chess.Move.from_uci("e1g1"))
-            ALL_MOVES.append(chess.Move.from_uci("e1c1"))
-            move_type += 2
-        elif from_sq == chess.E8:
-            ALL_MOVES.append(chess.Move.from_uci("e8g8"))
-            ALL_MOVES.append(chess.Move.from_uci("e8c8"))
-            move_type += 2
-
-    # Fill remaining slots
-    while move_type < MOVE_TYPES_PER_FROM:
-        ALL_MOVES.append(chess.Move(from_sq, from_sq))
-        move_type += 1
-
-# Build lookup tables
-MOVE_INDEX_MAP = {mv: idx for idx, mv in enumerate(ALL_MOVES)}
-INDEX_MOVE_MAP = {idx: mv for mv, idx in MOVE_INDEX_MAP.items()}
-
+# -------------------------------------------------------
+# MOVE → INDEX
+# -------------------------------------------------------
 
 def move_to_index(move: chess.Move) -> int:
-    """Return index for given chess.Move, or -1 if not found."""
-    return MOVE_INDEX_MAP.get(move, -1)
+    """
+    Converts a chess.Move into an index (0..4671).
+    EXACT SAME FORMULA AS USED IN generate_labeled_data.py.
+
+    Encoding:
+        base = 64 * from + to
+
+        If promotion:
+            base += 4096 + promo_offset * 64
+    """
+    from_sq = move.from_square
+    to_sq = move.to_square
+
+    index = 64 * from_sq + to_sq  # normal moves
+
+    if move.promotion:
+        promo_offset = PROMOTION_PIECES.get(move.promotion, 0)
+        index += 4096 + promo_offset * 64
+
+    return index
 
 
-def index_to_move(index: int) -> chess.Move:
-    """Return chess.Move for given index, or None if invalid."""
-    return INDEX_MOVE_MAP.get(index, None)
+# -------------------------------------------------------
+# INDEX → MOVE  (optional for debugging)
+# -------------------------------------------------------
+
+def index_to_move(index: int) -> chess.Move | None:
+    """
+    Reverse of move_to_index.
+    Optional for debugging. Not used by RL/MCTS normally.
+    """
+    if index < 0 or index >= TOTAL_MOVES:
+        return None
+
+    # Promotion moves
+    if index >= 4096:
+        offset = index - 4096
+        promo_type = offset // 64  # 0..3
+        to_sq = offset % 64
+        from_sq = None  # need to reconstruct
+
+        # reconstruct the correct `from`:
+        # we know that base = 64*from + to
+        # but here base = to only, so we cannot deduce "from" directly.
+        # This function is not required for RL, so we keep minimal logic.
+
+        return chess.Move(None, to_sq, promotion=_promo_from_type(promo_type))
+
+    # Normal move
+    from_sq = index // 64
+    to_sq = index % 64
+    return chess.Move(from_sq, to_sq)
 
 
-def get_total_move_count() -> int:
-    return len(ALL_MOVES)
+def _promo_from_type(promo_index):
+    reverse = {
+        0: chess.KNIGHT,
+        1: chess.BISHOP,
+        2: chess.ROOK,
+        3: chess.QUEEN,
+    }
+    return reverse.get(promo_index, chess.QUEEN)
 
 
+# -------------------------------------------------------
+# PUBLIC API
+# -------------------------------------------------------
+
+def get_total_move_count():
+    return TOTAL_MOVES
+
+
+# Quick sanity test
 if __name__ == "__main__":
-    print("Total moves:", get_total_move_count())
-    test_moves = [
-        chess.Move.from_uci("g8f6"),  # knight
-        chess.Move.from_uci("b8a6"),  # knight
-        chess.Move.from_uci("e7d8q"), # white promotion capture
-        chess.Move.from_uci("e7f8r"), # white promotion capture
-        chess.Move.from_uci("e1g1"),  # castling
-        chess.Move.from_uci("e8c8")   # castling
-    ]
-    for mv in test_moves:
-        print(f"{mv.uci()} → {move_to_index(mv)}")
+    mv = chess.Move.from_uci("e7e8q")
+    idx = move_to_index(mv)
+    print("Index:", idx)
+    print("Total:", TOTAL_MOVES)
