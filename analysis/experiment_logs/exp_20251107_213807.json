@@ -1,0 +1,10 @@
+{
+  "timestamp": "2025-11-07 21:38:07",
+  "num_episodes": 100,
+  "total_positions": 66509,
+  "win_rate": 0.08418409538558691,
+  "draw_rate": 0.8334060052023035,
+  "loss_rate": 0.08240989941210963,
+  "entropy_value_corr": 0.05682544750548383,
+  "plot_path": "/home/presi/projects/chess_ai_project/analysis/plots/selfplay_summary_20251107_213806.png"
+}
