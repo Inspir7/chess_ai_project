@@ -1,114 +1,133 @@
+# training/move_encoding.py
+
 import chess
 
-MOVE_TYPES_PER_FROM = 73
-TOTAL_MOVES = 64 * MOVE_TYPES_PER_FROM
+# ============================================================
+# CONSTANTS
+# AlphaZero-style flat policy: 4672 entries
+#   0..4095    = 64*64 normal moves
+#   4096..4159 = promotions to Knight (64)
+#   4160..4223 = promotions to Bishop (64)
+#   4224..4287 = promotions to Rook   (64)
+#   4288..4351 = promotions to Queen  (64)
+# TOTAL = 4096 + 4*64 = 4672
+# ============================================================
 
-# Directions (dx, dy): x = file (column), y = rank (row)
-DIRECTIONS = [
-    (1, 0), (-1, 0), (0, 1), (0, -1),     # rook-like
-    (1, 1), (1, -1), (-1, 1), (-1, -1)    # bishop-like
-]
+TOTAL_MOVES = 4672
 
-KNIGHT_OFFSETS = [
-    (2, 1), (1, 2), (-1, 2), (-2, 1),
-    (-2, -1), (-1, -2), (1, -2), (2, -1)
-]
+PROMOTION_MAP = {
+    chess.KNIGHT: 0,
+    chess.BISHOP: 1,
+    chess.ROOK:   2,
+    chess.QUEEN:  3,
+}
 
-PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
-
-ALL_MOVES = []
-
-
-def in_bounds(file, rank):
-    return 0 <= file < 8 and 0 <= rank < 8
+REVERSE_PROMO = {
+    0: chess.KNIGHT,
+    1: chess.BISHOP,
+    2: chess.ROOK,
+    3: chess.QUEEN,
+}
 
 
-for from_sq in range(64):
-    file = chess.square_file(from_sq)
-    rank = chess.square_rank(from_sq)
-    move_type = 0
-
-    # Sliding moves (8 directions × up to 7 steps)
-    for dx, dy in DIRECTIONS:
-        for dist in range(1, 8):
-            tx, ty = file + dx * dist, rank + dy * dist
-            if in_bounds(tx, ty):
-                to_sq = chess.square(tx, ty)
-                ALL_MOVES.append(chess.Move(from_sq, to_sq))
-                move_type += 1
-            else:
-                break
-
-    # Knight moves (8 offsets)
-    for dx, dy in KNIGHT_OFFSETS:
-        tx, ty = file + dx, rank + dy
-        if in_bounds(tx, ty):
-            to_sq = chess.square(tx, ty)
-            ALL_MOVES.append(chess.Move(from_sq, to_sq))
-            move_type += 1
-
-    # Pawn promotions (both colors)
-    if rank == 6:  # white pawn promotions
-        for dx in [-1, 0, 1]:
-            tx, ty = file + dx, rank + 1
-            if in_bounds(tx, ty):
-                to_sq = chess.square(tx, ty)
-                for promo_piece in PROMO_PIECES:
-                    ALL_MOVES.append(chess.Move(from_sq, to_sq, promotion=promo_piece))
-                    move_type += 1
-    if rank == 1:  # black pawn promotions
-        for dx in [-1, 0, 1]:
-            tx, ty = file + dx, rank - 1
-            if in_bounds(tx, ty):
-                to_sq = chess.square(tx, ty)
-                for promo_piece in PROMO_PIECES:
-                    ALL_MOVES.append(chess.Move(from_sq, to_sq, promotion=promo_piece))
-                    move_type += 1
-
-    # Add castling moves for king squares
-    if from_sq in [chess.E1, chess.E8]:
-        if from_sq == chess.E1:
-            ALL_MOVES.append(chess.Move.from_uci("e1g1"))
-            ALL_MOVES.append(chess.Move.from_uci("e1c1"))
-            move_type += 2
-        elif from_sq == chess.E8:
-            ALL_MOVES.append(chess.Move.from_uci("e8g8"))
-            ALL_MOVES.append(chess.Move.from_uci("e8c8"))
-            move_type += 2
-
-    # Fill remaining slots
-    while move_type < MOVE_TYPES_PER_FROM:
-        ALL_MOVES.append(chess.Move(from_sq, from_sq))
-        move_type += 1
-
-# Build lookup tables
-MOVE_INDEX_MAP = {mv: idx for idx, mv in enumerate(ALL_MOVES)}
-INDEX_MOVE_MAP = {idx: mv for mv, idx in MOVE_INDEX_MAP.items()}
-
+# ============================================================
+# MOVE → INDEX
+# (MUST remain identical to generate_labeled_data)
+# ============================================================
 
 def move_to_index(move: chess.Move) -> int:
-    """Return index for given chess.Move, or -1 if not found."""
-    return MOVE_INDEX_MAP.get(move, -1)
+    """
+    Convert chess.Move into index 0..4671.
+    100% consistent with generate_labeled_data.py
+    """
+
+    from_sq = move.from_square
+    to_sq = move.to_square
+
+    index = 64 * from_sq + to_sq  # normal move
+
+    # Promotion
+    if move.promotion:
+        promo_type = PROMOTION_MAP.get(move.promotion, 3)
+        index = 4096 + promo_type * 64 + to_sq
+
+    return index
 
 
-def index_to_move(index: int) -> chess.Move:
-    """Return chess.Move for given index, or None if invalid."""
-    return INDEX_MOVE_MAP.get(index, None)
+# ============================================================
+# INDEX → MOVE  (Debug use only)
+# ============================================================
 
+def index_to_move(index: int) -> chess.Move | None:
+    if index < 0 or index >= TOTAL_MOVES:
+        return None
+
+    # Promotion zone
+    if index >= 4096:
+        offset = index - 4096
+        promo_type = offset // 64
+        to_sq = offset % 64
+        promo = REVERSE_PROMO.get(promo_type, chess.QUEEN)
+
+        # Cannot reconstruct from-square without board context
+        return chess.Move(None, to_sq, promotion=promo)
+
+    # Normal move
+    from_sq = index // 64
+    to_sq   = index % 64
+    return chess.Move(from_sq, to_sq)
+
+
+# ============================================================
+# GEOMETRICAL FLIP FOR DATA AUGMENTATION
+# ============================================================
+
+def flip_square(sq: int) -> int:
+    """
+    Mirror horizontally (a <-> h).
+    Works on 0..63.
+    """
+    rank = sq // 8
+    file = sq % 8
+    file_flipped = 7 - file
+    return rank * 8 + file_flipped
+
+
+def flip_move_index(idx: int) -> int:
+    """
+    Mirror a move index over the vertical axis.
+    Works for both normal moves and promotions.
+    """
+
+    # Promotion moves
+    if idx >= 4096:
+        offset = idx - 4096
+        promo_type = offset // 64  # 0..3
+        to_sq = offset % 64
+
+        new_to = flip_square(to_sq)
+        return 4096 + promo_type * 64 + new_to
+
+    # Normal move
+    from_sq = idx // 64
+    to_sq = idx % 64
+
+    new_from = flip_square(from_sq)
+    new_to   = flip_square(to_sq)
+
+    return new_from * 64 + new_to
+
+
+# ============================================================
+# PUBLIC API
+# ============================================================
 
 def get_total_move_count() -> int:
-    return len(ALL_MOVES)
+    return TOTAL_MOVES
 
 
+# Quick test
 if __name__ == "__main__":
-    print("Total moves:", get_total_move_count())
-    test_moves = [
-        chess.Move.from_uci("g8f6"),  # knight
-        chess.Move.from_uci("b8a6"),  # knight
-        chess.Move.from_uci("e7d8q"), # white promotion capture
-        chess.Move.from_uci("e7f8r"), # white promotion capture
-        chess.Move.from_uci("e1g1"),  # castling
-        chess.Move.from_uci("e8c8")   # castling
-    ]
-    for mv in test_moves:
-        print(f"{mv.uci()} → {move_to_index(mv)}")
+    print("TOTAL =", TOTAL_MOVES)
+    mv = chess.Move.from_uci("e7e8q")
+    print("e7e8q index:", move_to_index(mv))

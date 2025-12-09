@@ -7,7 +7,7 @@ import re
 from torch.nn import functional as F
 
 from models.AlphaZero import AlphaZeroModel
-from training.move_encoding import index_to_move
+from models.move_encoding import index_to_move
 
 
 class ChessLabeledTensorDataset(torch.utils.data.Dataset):

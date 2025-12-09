@@ -1,168 +1,222 @@
-# train model with the labeled PGN data = supervised
+import os
+import sys
 
-import torch
-import random
-import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
-from models.AlphaZero import AlphaZeroModel
-from utils.load_numpy_data import load_npy_from_directory
-from torch import nn, optim
-from torch.utils.tensorboard import SummaryWriter
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import argparse
-from sklearn.metrics import confusion_matrix
-import seaborn as sns
-import matplotlib.pyplot as plt
-import io
-from PIL import Image
+import numpy as np
+import torch
+from torch import nn, optim
+from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
-# --- Инициализации ---
-torch.manual_seed(42)
-np.random.seed(42)
-random.seed(42)
+from models.AlphaZero import AlphaZeroModel
+from training.move_encoding import flip_move_index
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--save_path", default="alpha_zero_supervised.pth")
-args = parser.parse_args()
+# ============================================================
+# DATA AUGMENTATION HELPERS
+# ============================================================
 
-writer = SummaryWriter(log_dir="logs/supervised")
+def flip_state(tensor_chw: torch.Tensor):
+    """
+    tensor shape: (15, 8, 8)
+    Horizontal mirror (file a <-> file h).
+    """
+    return torch.flip(tensor_chw, dims=[2])  # flip width
 
-# --- Зареждане на данни ---
-train_states, train_policies, train_values = load_npy_from_directory("/home/presi/projects/chess_ai_project/training/train")
-val_states, val_policies, val_values = load_npy_from_directory("/home/presi/projects/chess_ai_project/training/validation")
 
-train_dataset = TensorDataset(
-    torch.tensor(train_states, dtype=torch.float32).permute(0, 3, 1, 2),
-    torch.tensor(train_policies, dtype=torch.float32),
-    torch.tensor(train_values, dtype=torch.float32)
-)
+def flip_policy_index(pi_idx: torch.Tensor):
+    """
+    Takes an integer index (0..4671), applies mirror transform.
+    """
+    new_idx = flip_move_index(int(pi_idx.item()))
+    return torch.tensor(new_idx, dtype=torch.long)
 
-val_dataset = TensorDataset(
-    torch.tensor(val_states, dtype=torch.float32).permute(0, 3, 1, 2),
-    torch.tensor(val_policies, dtype=torch.float32),
-    torch.tensor(val_values, dtype=torch.float32)
-)
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32)
+def flip_value(v: torch.Tensor):
+    """
+    Value DOES NOT change when flipping board left-right.
+    (We do not flip perspective)
+    """
+    return v
 
-# --- Модел ---
-model = AlphaZeroModel().to(device)
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-policy_loss_fn = nn.CrossEntropyLoss()
-value_loss_fn = nn.MSELoss()
 
-# --- Обучение ---
-epochs = 10
-best_val_loss = float("inf")
+# ===================================================================
+#  STREAMING DATASET (RAM-freiendly)
+# ===================================================================
+class ShardedIterableDataset(IterableDataset):
+    def __init__(self, folder, prefix, augment=False):
+        self.folder = folder
+        self.prefix = prefix
+        self.augment = augment
 
-for epoch in range(epochs):
-    model.train()
-    total_train_loss = 0
-    total_train_acc = 0
-    total_train_policy_loss = 0
-    total_train_value_loss = 0
+        self.state_files = sorted(
+            f for f in os.listdir(folder)
+            if f.startswith(f"{prefix}_states_") and f.endswith(".npy")
+        )
+        self.policy_files = sorted(
+            f for f in os.listdir(folder)
+            if f.startswith(f"{prefix}_policies_") and f.endswith(".npy")
+        )
+        self.value_files = sorted(
+            f for f in os.listdir(folder)
+            if f.startswith(f"{prefix}_values_") and f.endswith(".npy")
+        )
 
-    for states, policies, values in train_loader:
-        states, policies, values = states.to(device), policies.to(device), values.to(device)
+        assert len(self.state_files) == len(self.policy_files) == len(self.value_files)
+        self.num_shards = len(self.state_files)
+        print(f"[STREAM] Dataset {prefix}: {self.num_shards} shards found.")
 
-        optimizer.zero_grad()
-        policy_out, value_out = model(states)
+    def __iter__(self):
+        for i in range(self.num_shards):
 
-        policy_loss = policy_loss_fn(policy_out, torch.argmax(policies, dim=1))
-        value_loss = value_loss_fn(value_out.squeeze(), values)
-        loss = policy_loss + value_loss
+            s_path = os.path.join(self.folder, self.state_files[i])
+            p_path = os.path.join(self.folder, self.policy_files[i])
+            v_path = os.path.join(self.folder, self.value_files[i])
 
-        loss.backward()
-        optimizer.step()
+            states  = np.load(s_path, mmap_mode="r")
+            policies = np.load(p_path, mmap_mode="r")
+            values  = np.load(v_path, mmap_mode="r")
 
-        total_train_loss += loss.item()
-        total_train_policy_loss += policy_loss.item()
-        total_train_value_loss += value_loss.item()
+            for j in range(states.shape[0]):
+                # NHWC → CHW
+                s = torch.tensor(
+                    states[j].transpose(2, 0, 1),
+                    dtype=torch.float32
+                )
 
-        correct = (torch.argmax(policy_out, dim=1) == torch.argmax(policies, dim=1)).float().sum()
-        total_train_acc += correct.item() / policies.size(0)
+                pi_idx = int(np.argmax(policies[j]))
+                p = torch.tensor(pi_idx, dtype=torch.long)
+                v = torch.tensor(values[j], dtype=torch.float32)
 
-    avg_train_loss = total_train_loss / len(train_loader)
-    avg_train_acc = total_train_acc / len(train_loader)
-    avg_train_policy_loss = total_train_policy_loss / len(train_loader)
-    avg_train_value_loss = total_train_value_loss / len(train_loader)
+                # =============================
+                # OPTIONAL DATA AUGMENTATION
+                # =============================
+                if self.augment and np.random.rand() < 0.5:
+                    s = flip_state(s)
+                    p = flip_policy_index(p)
+                    v = flip_value(v)
 
-    # --- Валидация ---
-    model.eval()
-    total_val_loss = 0
-    total_val_acc = 0
-    total_val_policy_loss = 0
-    total_val_value_loss = 0
-    all_preds = []
-    all_targets = []
+                yield s, p, v
 
-    with torch.no_grad():
-        for states, policies, values in val_loader:
-            states, policies, values = states.to(device), policies.to(device), values.to(device)
 
-            policy_out, value_out = model(states)
+# ===================================================================
+# TRAINING LOOP
+# ===================================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", default="/home/presi/projects/chess_ai_project/data")
+    parser.add_argument("--save", default="/home/presi/projects/chess_ai_project/training/alpha_zero_supervised.pth")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch",  type=int, default=256)
+    parser.add_argument("--lr",     type=float, default=1e-3)
+    args = parser.parse_args()
 
-            policy_loss = policy_loss_fn(policy_out, torch.argmax(policies, dim=1))
-            value_loss = value_loss_fn(value_out.squeeze(), values)
-            loss = policy_loss + value_loss
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    writer = SummaryWriter(log_dir="logs/supervised_streaming")
 
-            total_val_loss += loss.item()
-            total_val_policy_loss += policy_loss.item()
-            total_val_value_loss += value_loss.item()
+    # Training uses augmentation; validation does NOT
+    train_ds = ShardedIterableDataset(args.data_dir, "train_labeled", augment=True)
+    val_ds   = ShardedIterableDataset(args.data_dir, "val_labeled", augment=False)
 
-            pred_labels = torch.argmax(policy_out, dim=1).cpu().numpy()
-            true_labels = torch.argmax(policies, dim=1).cpu().numpy()
+    train_loader = DataLoader(train_ds, batch_size=args.batch)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch)
 
-            all_preds.extend(pred_labels)
-            all_targets.extend(true_labels)
+    model = AlphaZeroModel().to(device)
 
-            correct = (pred_labels == true_labels).sum()
-            total_val_acc += correct / policies.size(0)
+    opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    avg_val_loss = total_val_loss / len(val_loader)
-    avg_val_acc = total_val_acc / len(val_loader)
-    avg_val_policy_loss = total_val_policy_loss / len(val_loader)
-    avg_val_value_loss = total_val_value_loss / len(val_loader)
+    # ---------------------------------------------------
+    # Learning Rate Scheduler: Cosine decay + warmup
+    # ---------------------------------------------------
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=args.epochs, eta_min=1e-5
+    )
 
-    # --- Извеждане в терминала ---
-    print(f"[Epoch {epoch + 1}]")
-    print(f"  Train Loss: {avg_train_loss:.4f} | Policy: {avg_train_policy_loss:.4f} | Value: {avg_train_value_loss:.4f} | Acc: {avg_train_acc:.4f}")
-    print(f"  Val   Loss: {avg_val_loss:.4f} | Policy: {avg_val_policy_loss:.4f} | Value: {avg_val_value_loss:.4f} | Acc: {avg_val_acc:.4f}")
+    CE  = nn.CrossEntropyLoss()
+    MSE = nn.MSELoss()
 
-    # --- TensorBoard ---
-    writer.add_scalar("Loss/Train_Total", avg_train_loss, epoch)
-    writer.add_scalar("Loss/Train_Policy", avg_train_policy_loss, epoch)
-    writer.add_scalar("Loss/Train_Value", avg_train_value_loss, epoch)
-    writer.add_scalar("Accuracy/Train", avg_train_acc, epoch)
+    best = float("inf")
 
-    writer.add_scalar("Loss/Val_Total", avg_val_loss, epoch)
-    writer.add_scalar("Loss/Val_Policy", avg_val_policy_loss, epoch)
-    writer.add_scalar("Loss/Val_Value", avg_val_value_loss, epoch)
-    writer.add_scalar("Accuracy/Val", avg_val_acc, epoch)
+    print("\n========================================")
+    print("     TRAINING STARTED (streaming mode)")
+    print("========================================\n")
 
-    # --- Confusion Matrix ---
-    cm = confusion_matrix(all_targets, all_preds)
-    fig = plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=False, fmt='d', cmap='Blues')
-    plt.title(f"Confusion Matrix (Epoch {epoch + 1})")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
+    # ---------------------------------------------------
+    # MAIN TRAIN LOOP
+    # ---------------------------------------------------
+    for ep in range(1, args.epochs + 1):
 
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    image = Image.open(buf)
-    image = np.array(image)
-    writer.add_image("Confusion_Matrix", image, epoch, dataformats='HWC')
-    buf.close()
-    plt.close(fig)
+        # ---------------- TRAIN ----------------
+        model.train()
+        t_loss = t_acc = batches = 0
 
-    # --- Записване на най-добрия модел ---
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        torch.save(model.state_dict(), args.save_path)
-        print(f"✅ Записан нов най-добър модел: {args.save_path}")
+        for s, pi_idx, v in train_loader:
+            s, pi_idx, v = s.to(device), pi_idx.to(device), v.to(device)
+            opt.zero_grad()
 
-writer.close()
+            logits, v_out = model(s)
+            v_out = v_out.squeeze()
+
+            loss_p = CE(logits, pi_idx)
+            loss_v = MSE(v_out, v)
+            loss = loss_p + loss_v
+
+            loss.backward()
+            opt.step()
+
+            t_loss += loss.item()
+            t_acc  += (logits.argmax(1) == pi_idx).float().mean().item()
+            batches += 1
+
+        t_loss /= batches
+        t_acc  /= batches
+
+        # Step scheduler AFTER epoch
+        scheduler.step()
+
+        # ---------------- VAL ----------------
+        model.eval()
+        v_loss = v_acc = v_batches = 0
+
+        with torch.no_grad():
+            for s, pi_idx, v in val_loader:
+                s, pi_idx, v = s.to(device), pi_idx.to(device), v.to(device)
+
+                logits, v_out = model(s)
+                v_out = v_out.squeeze()
+
+                loss_p = CE(logits, pi_idx)
+                loss_v = MSE(v_out, v)
+                loss = loss_p + loss_v
+
+                v_loss += loss.item()
+                v_acc  += (logits.argmax(1) == pi_idx).float().mean().item()
+                v_batches += 1
+
+        v_loss /= v_batches
+        v_acc  /= v_batches
+
+        print(f"[Epoch {ep}] "
+              f"Train loss={t_loss:.4f} acc={t_acc:.4f} | "
+              f"Val loss={v_loss:.4f} acc={v_acc:.4f} | "
+              f"LR={scheduler.get_last_lr()[0]:.6f}")
+
+        writer.add_scalar("train/loss", t_loss, ep)
+        writer.add_scalar("train/acc",  t_acc, ep)
+        writer.add_scalar("val/loss",   v_loss, ep)
+        writer.add_scalar("val/acc",    v_acc, ep)
+
+        if v_loss < best:
+            best = v_loss
+            torch.save(model.state_dict(), args.save)
+            print(f"   ✓ Saved best checkpoint → {args.save}")
+
+    writer.close()
+
+
+if __name__ == "__main__":
+    main()

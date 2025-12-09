@@ -1,312 +1,321 @@
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-from data.generate_labeled_data import fen_to_tensor
-from models.move_encoding import move_to_index
+import chess
 
+from data.generate_labeled_data import fen_to_tensor
+from training.move_encoding import move_to_index, get_total_move_count
+
+
+# =====================================================
+# MCTS Node
+# =====================================================
 
 class MCTSNode:
+    __slots__ = ("board", "parent", "prior", "visit_count", "value_sum", "children", "is_expanded")
+
     def __init__(self, board, parent=None, prior=0.0):
         self.board = board
         self.parent = parent
-        self.prior = prior
+        self.prior = float(prior)
+
         self.visit_count = 0
         self.value_sum = 0.0
         self.children = {}
 
-    def expanded(self):
-        return len(self.children) > 0
+        self.is_expanded = False
 
-    def value(self):
-        return self.value_sum / self.visit_count if self.visit_count > 0 else 0.0
+    @property
+    def q_value(self):
+        if self.visit_count == 0:
+            return 0.0
+        return self.value_sum / self.visit_count
 
+
+# =====================================================
+# MCTS (AlphaZero-style)
+# =====================================================
 
 class MCTS:
-    def __init__(self, model, device, simulations=800, c_puct=1.0, temperature=1.0, verbose=False):
+    def __init__(
+        self,
+        model,
+        device,
+        simulations=200,
+        c_puct=1.2,
+        dirichlet_alpha=0.3,
+        dirichlet_epsilon=0.25,
+        batch_size=16,
+    ):
+        """
+        model: AlphaZero policy-value network
+        device: torch.device
+        simulations: брой MCTS симулации за ход
+        c_puct: коефициент за баланс exploration / exploitation
+        dirichlet_*: параметри за root noise (само на корена)
+        """
         self.model = model
         self.device = device
         self.simulations = simulations
         self.c_puct = c_puct
-        self.temperature = temperature
-        self.verbose = verbose
-        self.root = None
 
-    # --- utility to perform a cheaper terminal check first ---
-    def _is_terminal(self, board):
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
+
+        self.batch_size = batch_size
+        self.total_moves = get_total_move_count()
+
+    # =====================================================
+    # Public Interface
+    # =====================================================
+    def run(self, root_board, move_number=None):
         """
-        Cheap terminal checks first (very fast): checkmate, stalemate, insufficient material.
-        Only if those are False we fall back to a full is_game_over check with claim_draw=False
-        to avoid expensive repetition scans in the common case.
+        Стартира MCTS търсене и връща dict {move: prob}.
+
+        move_number: номер на полухода, за да контролираме
+        Dirichlet шума в по-късните фази на партията.
         """
-        try:
-            if board.is_checkmate():
-                return True, 1.0 if board.turn == False else -1.0  # if checkmate, previous player won
-            if board.is_stalemate():
-                return True, 0.0
-            if board.is_insufficient_material():
-                return True, 0.0
-        except Exception:
-            # if any board method errors (shouldn't), fallback to full check below
-            pass
+        root = MCTSNode(root_board.copy(stack=False))
 
-        # fallback: do a full game-over check but avoid expensive claim_draw by default
-        try:
-            game_over = board.is_game_over(claim_draw=False)
-        except TypeError:
-            # older python-chess: no claim_draw param
-            game_over = board.is_game_over()
-        if game_over:
-            try:
-                res = board.result(claim_draw=False)
-            except Exception:
-                try:
-                    res = board.result()
-                except Exception:
-                    res = "1/2-1/2"
-            if res == "1-0":
-                return True, 1.0
-            elif res == "0-1":
-                return True, -1.0
-            else:
-                return True, 0.0
-        return False, 0.0
+        # Първоначална експанзия на root
+        self._expand_node(root)
 
-    def run(self, root_board):
-        # Use stack=False to avoid copying full move_stack when possible (big speedup on deep games)
-        try:
-            rb = root_board.copy(stack=False)
-        except TypeError:
-            rb = root_board.copy()
-        self.root = MCTSNode(rb)
+        # Добавяме Dirichlet noise ВЕДНЪЖ в началото
+        self._apply_dirichlet_noise(root, move_number)
 
-        if self.verbose:
-            print("[MCTS] Starting search...")
+        pending = []
 
-        # === Initial expansion ===
-        policy, _ = self._model_eval(self.root.board)
-
-        # === Add Dirichlet noise at the root for exploration (if any legal moves) ===
-        epsilon = 0.25
-        alpha = 0.3
-        legal_moves = list(policy.keys())
-        if len(legal_moves) > 0:
-            try:
-                noise = np.random.dirichlet([alpha] * len(legal_moves))
-                for i, move in enumerate(legal_moves):
-                    policy[move] = (1 - epsilon) * policy[move] + epsilon * noise[i]
-                # renormalize
-                total = sum(policy.values())
-                if total > 0.0:
-                    for mv in policy:
-                        policy[mv] /= total
-            except Exception:
-                # if dirichlet fails for any reason, continue without noise
-                pass
-
-        # === Expand root node children ===
-        for move, p in policy.items():
-            try:
-                try:
-                    next_board = self.root.board.copy(stack=False)
-                except TypeError:
-                    next_board = self.root.board.copy()
-                next_board.push(move)
-                self.root.children[move] = MCTSNode(next_board, parent=self.root, prior=p)
-            except Exception:
-                # if copying or pushing fails, skip that child
-                if self.verbose:
-                    print(f"[MCTS] Warning: failed to create child for move {move}. Skipping.")
-
-        # === Simulations ===
         for sim in range(self.simulations):
-            node = self.root
-            search_path = [node]
+            node = root
+            path = [node]
 
-            # Selection — descend to a leaf
-            while node.expanded():
+            # Selection
+            while node.is_expanded and node.children:
                 move, node = self._select_child(node)
-                search_path.append(node)
+                path.append(node)
 
-            # Expansion / Evaluation
-            terminal, terminal_value = self._is_terminal(node.board)
-            if terminal:
-                value = terminal_value
+            pending.append((node, path))
+
+            # Batch-ова оценка
+            if len(pending) >= self.batch_size or sim == self.simulations - 1:
+                self._evaluate_batch(pending)
+                pending = []
+
+        return self._compute_root_policy(root)
+
+    # =====================================================
+    # Node expansion (single)
+    # =====================================================
+    def _expand_node(self, node):
+        board = node.board
+
+        if board.is_game_over():
+            # value от гледна точка на ИГРАЧА НА ХОД
+            res = board.result()
+            if res == "1-0":
+                value = 1.0 if board.turn == chess.WHITE else -1.0
+            elif res == "0-1":
+                value = 1.0 if board.turn == chess.BLACK else -1.0
             else:
-                try:
-                    policy, value = self._model_eval(node.board)
-                except Exception as e:
-                    # model.eval failed unexpectedly; treat node as draw to avoid hang
-                    if self.verbose:
-                        print(f"[MCTS] Model eval failed: {e}. Treating as draw for this simulation.")
-                    value = 0.0
-                    policy = {}
+                value = 0.0
 
-                # create children from returned policy (only for legal moves)
-                try:
-                    for mv, p in policy.items():
-                        if mv not in node.children:
-                            try:
-                                try:
-                                    child_board = node.board.copy(stack=False)
-                                except TypeError:
-                                    child_board = node.board.copy()
-                                child_board.push(mv)
-                                node.children[mv] = MCTSNode(child_board, parent=node, prior=p)
-                            except Exception:
-                                # skip moves that fail to copy/push
-                                if self.verbose:
-                                    print(f"[MCTS] Warning: failed to expand child move {mv}")
-                                continue
-                except Exception:
-                    # defensive: if policy iterable fails, continue
-                    pass
+            node.value_sum += value
+            node.visit_count += 1
+            node.is_expanded = True
+            return
 
-            # Backpropagation (negate value up the path)
-            for nd in reversed(search_path):
-                nd.visit_count += 1
-                nd.value_sum += value
-                value = -value
+        legal = list(board.legal_moves)
+        if not legal:
+            node.value_sum += 0.0
+            node.visit_count += 1
+            node.is_expanded = True
+            return
 
-            # occasional verbose progress
-            if self.verbose and (sim + 1) % 50 == 0:
-                print(f"[MCTS] Simulation {sim + 1}/{self.simulations} complete")
+        # Encode state
+        s = fen_to_tensor(board.fen())
+        s = np.array(s, dtype=np.float32)
 
-        # Build visit distribution at root
-        visits = {move: child.visit_count for move, child in self.root.children.items()}
-        pi = self._apply_temperature(visits)
+        # HWC → CHW
+        if s.shape == (8, 8, 15):
+            s = np.transpose(s, (2, 0, 1))
+        elif s.shape != (15, 8, 8):
+            s = s.reshape(15, 8, 8)
 
-        if self.verbose:
-            print("[MCTS] Final move probabilities:")
-            for mv, prob in sorted(pi.items(), key=lambda x: -x[1]):
-                print(f"  {mv}: {round(prob, 3)}")
+        state_tensor = torch.tensor(s, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        return pi
+        with torch.no_grad():
+            policy_logits, value = self.model(state_tensor)
+            policy = torch.softmax(policy_logits, dim=1).squeeze().cpu().numpy()
+            value = float(value.item())
 
+        node.is_expanded = True
+
+        # Деца
+        for mv in legal:
+            idx = move_to_index(mv)
+            if idx is None or idx < 0 or idx >= self.total_moves:
+                continue
+            p = policy[idx]
+            child_board = board.copy(stack=False)
+            child_board.push(mv)
+            node.children[mv] = MCTSNode(child_board, parent=node, prior=p)
+
+        if not node.children:
+            # safety fallback – равномерно
+            mv = legal[0]
+            child_board = board.copy(stack=False)
+            child_board.push(mv)
+            node.children[mv] = MCTSNode(child_board, parent=node, prior=1.0 / len(legal))
+
+        return value
+
+    # =====================================================
+    # Dirichlet Noise at Root
+    # =====================================================
+    def _apply_dirichlet_noise(self, root, move_number):
+        if not root.children:
+            return
+
+        # Noise само в ранната игра (примерно първите 30 полухода)
+        if move_number is not None and move_number > 30:
+            return
+
+        eps = self.dirichlet_epsilon
+        moves = list(root.children.keys())
+        noise = np.random.dirichlet([self.dirichlet_alpha] * len(moves))
+
+        for mv, n in zip(moves, noise):
+            child = root.children[mv]
+            child.prior = (1.0 - eps) * child.prior + eps * float(n)
+
+    # =====================================================
+    # Selection (PUCT)
+    # =====================================================
     def _select_child(self, node):
-        best_score = -float('inf')
+        best_score = -1e9
         best_move = None
         best_child = None
 
-        # protect against node.visit_count == 0 (root before any visits)
         parent_visits = max(1, node.visit_count)
+        sqrt_parent = math.sqrt(parent_visits)
 
-        for move, child in node.children.items():
-            # UCB-style score with prior
-            u = self.c_puct * child.prior * math.sqrt(parent_visits) / (1 + child.visit_count)
-            score = child.value() + u
+        for mv, child in node.children.items():
+            q = child.q_value
+            u = self.c_puct * child.prior * (sqrt_parent / (1 + child.visit_count))
+            score = q + u
             if score > best_score:
                 best_score = score
-                best_move = move
+                best_move = mv
                 best_child = child
 
         return best_move, best_child
 
-    def _safe_scalar(self, prob):
-        if isinstance(prob, np.ndarray):
-            prob = prob.squeeze()
-            if getattr(prob, "size", None) != 1:
-                raise ValueError(f"Expected scalar, got array with shape {prob.shape}")
-            return float(prob.item())
-        return float(prob)
+    # =====================================================
+    # Batch Evaluation + Expansion
+    # =====================================================
+    def _evaluate_batch(self, pending):
+        # split terminal and non-terminal
+        terminal = []
+        nonterm = []
 
-    def _model_eval(self, board):
-        """
-        Evaluate board using model: returns (policy_dict over legal moves, scalar value).
-        The policy is a mapping move -> probability (not necessarily normalized first).
-        """
-        np_tensor = fen_to_tensor(board.fen())
-        # ensure shape (1, C, H, W)
-        x = torch.tensor(np_tensor, dtype=torch.float32, device=self.device).unsqueeze(0).permute(0, 3, 1, 2)
-
-        with torch.no_grad():
-            logits, value = self.model(x)
-
-        probs = F.softmax(logits, dim=1)[0].cpu()
-        legal = list(board.legal_moves)
-        policy = {}
-
-        for move in legal:
-            # try mapping move -> index (some move encoders accept board as second arg)
-            try:
-                idx = move_to_index(move, board)
-            except TypeError:
-                idx = move_to_index(move)
-
-            if idx is None:
-                # unmapped move — skip
-                if self.verbose:
-                    pass  # intentionally silent or you can log
-                continue
-
-            if not isinstance(idx, int) or idx < 0 or idx >= len(probs):
-                continue
-
-            try:
-                prob = self._safe_scalar(probs[idx])
-            except Exception:
-                prob = 0.0
-            policy[move] = prob
-
-        # normalize policy; if empty (shouldn't), fallback to uniform over legal moves
-        total = sum(policy.values())
-        if total > 0.0:
-            for mv in policy:
-                policy[mv] /= total
-        else:
-            if len(legal) > 0:
-                uniform = 1.0 / len(legal)
-                policy = {mv: uniform for mv in legal}
+        for node, path in pending:
+            if node.board.is_game_over():
+                terminal.append((node, path))
             else:
-                policy = {}
+                nonterm.append((node, path))
 
-        return policy, float(value.item())
+        # Handle terminal nodes
+        for node, path in terminal:
+            res = node.board.result()
+            board = node.board
 
-    def _apply_temperature(self, visits):
-        temp = self.temperature
-        if not visits:
-            return {}
+            if res == "1-0":
+                v = 1.0 if board.turn == chess.WHITE else -1.0
+            elif res == "0-1":
+                v = 1.0 if board.turn == chess.BLACK else -1.0
+            else:
+                v = 0.0
 
-        if temp == 0:
-            best_move = max(visits.items(), key=lambda x: x[1])[0]
-            return {move: 1.0 if move == best_move else 0.0 for move in visits}
+            self._backup(path, v)
 
-        # apply temperature to visit counts (common AlphaZero behaviour)
-        visits_temp = {move: (count ** (1.0 / temp)) for move, count in visits.items()}
-        total = sum(visits_temp.values())
-        if total <= 0.0:
-            # fallback uniform
-            n = len(visits_temp)
-            return {move: 1.0 / n for move in visits_temp}
-        return {move: prob / total for move, prob in visits_temp.items()}
+        # Evaluate non-terminal nodes in batch
+        if nonterm:
+            boards = [n.board for (n, _) in nonterm]
+            x = self._encode_boards(boards)
 
-    def select_move(self, board):
-        pi = self.run(board)
-        if not pi:
-            # fallback: choose any legal move
-            legal = list(board.legal_moves)
-            return legal[0] if legal else None
-        best_move = max(pi.items(), key=lambda x: x[1])[0]
-        return best_move
+            with torch.no_grad():
+                policy_logits, values = self.model(x)
+                policy_logits = policy_logits.cpu().numpy()
+                values = values.cpu().numpy().flatten()
 
-    def get_visit_count_distribution(self, vector_size=4672):
+            for i, (node, path) in enumerate(nonterm):
+                logits = policy_logits[i]
+                value = float(values[i])
+
+                self._expand_with_logits(node, logits)
+                self._backup(path, value)
+
+    def _encode_boards(self, boards):
         """
-        Returns normalized visit-count policy vector compatible with training (move vector length).
+        Бързо, безопасно batch-ване на бордове за MCTS inference.
+        Работи на NumPy 2.0 без copy=False грешки.
         """
-        if not hasattr(self, 'root') or self.root is None or len(self.root.children) == 0:
-            return np.zeros(vector_size, dtype=np.float32)
+        np_arrs = []
 
-        policy = np.zeros(vector_size, dtype=np.float32)
-        total_visits = sum(child.visit_count for child in self.root.children.values())
-        if total_visits == 0:
-            return policy
+        for b in boards:
+            s = fen_to_tensor(b.fen())
+            s = np.asarray(s, dtype=np.float32)
 
-        for move, child in self.root.children.items():
-            try:
-                idx = move_to_index(move, self.root.board)
-            except TypeError:
-                idx = move_to_index(move)
-            if isinstance(idx, int) and 0 <= idx < vector_size:
-                policy[idx] = child.visit_count / total_visits
+            # HWC → CHW
+            if s.shape == (8, 8, 15):
+                s = s.transpose(2, 0, 1)
+            elif s.shape != (15, 8, 8):
+                s = s.reshape(15, 8, 8)
 
-        return policy
+            np_arrs.append(s)
+
+        # Стекваме в масив (B, 15, 8, 8)
+        batch_np = np.stack(np_arrs, axis=0).astype(np.float32)
+
+        # Превръщаме в torch tensor по най-бързия начин
+        return torch.from_numpy(batch_np).to(self.device)
+
+    def _expand_with_logits(self, node, logits):
+        policy = torch.softmax(torch.tensor(logits), dim=0).numpy()
+
+        legal = list(node.board.legal_moves)
+        node.is_expanded = True
+
+        for mv in legal:
+            idx = move_to_index(mv)
+            if idx is None or idx < 0 or idx >= self.total_moves:
+                continue
+            p = policy[idx]
+            newb = node.board.copy(stack=False)
+            newb.push(mv)
+            node.children[mv] = MCTSNode(newb, parent=node, prior=float(p))
+
+    # =====================================================
+    # Backup
+    # =====================================================
+    def _backup(self, path, value):
+        v = value
+        for node in reversed(path):
+            node.value_sum += v
+            node.visit_count += 1
+            v = -v  # flip perspective
+
+    # =====================================================
+    # Final Policy at Root
+    # =====================================================
+    def _compute_root_policy(self, root):
+        moves = list(root.children.keys())
+        visits = np.array([root.children[mv].visit_count for mv in moves], dtype=np.float32)
+
+        if visits.sum() == 0:
+            probs = np.ones(len(moves), dtype=np.float32) / len(moves)
+        else:
+            probs = visits / visits.sum()
+
+        return {mv: float(p) for mv, p in zip(moves, probs)}
