@@ -146,7 +146,7 @@ class RLPipeline:
         optimizer_path: str = RL_OPT_PATH,
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
-        buffer_capacity: int = 200_000,
+        buffer_capacity: int = 1_200_000,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -279,7 +279,7 @@ class RLPipeline:
             data = queue.get()
 
             if data["error"]:
-                print(f("[WORKER ERROR] → {data['error']}"))
+                print(("[WORKER ERROR] → {data['error']}"))
                 continue
 
             all_examples.extend(data["examples"])
@@ -408,11 +408,14 @@ class RLPipeline:
 
         # Temperature schedule: линейно от temperature → final_temp
         temp_start = float(temperature)
-        temp_final = max(0.3, temp_start * 0.25)  # напр. 1.5 → 0.375
+        #temp_final = max(0.3, temp_start * 0.25)  # напр. 1.5 → 0.375
+        temp_final = 0.70
 
         # Automatic MCTS sims schedule: от sims_start → sims_end
         sims_start = int(sims)
-        sims_end = max(int(sims * 4), sims_start + 300)  # напр. 40 → поне 300+
+        #sims_end = max(int(sims * 4), sims_start + 300)  # напр. 40 → поне 300+
+        sims_end = min(sims_start + 200, 300) # максимум 300 simulations, расте леко, не експлодира
+
 
         try:
             global_step = 0
