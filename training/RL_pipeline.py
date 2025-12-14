@@ -1,6 +1,7 @@
 import sys
 import os
 import math  # за Elo proxy
+import copy
 
 # ==========================
 # Python path → project root
@@ -43,28 +44,30 @@ STATS_CSV = os.path.join(LOG_DIR, "rl_stats.csv")
 SUPERVISED_INIT_PATH = os.path.join(BASE_DIR, "alpha_zero_supervised.pth")
 
 # Основен RL модел и optimizer (тук се пазят чекпойнтовете)
-RL_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "alpha_zero_rl_main.pth")
+RL_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "alpha_zero_rl_checkpoint_final.pth")
 RL_OPT_PATH = os.path.join(CHECKPOINT_DIR, "alpha_zero_rl_opt.pth")
 
 # multiprocessing настройки (default-и – могат да се override-нат от CLI)
 NUM_PROCESSES = 2
 GAMES_PER_PROCESS = 1
 
-# Draw shaping (всички ремита се бутат леко към -0.15 в value главата)
-DRAW_VALUE_PENALTY = -0.15
+# Draw shaping – ВРЕМЕННО изключено (иначе bias-ва value head-а)
+# CHANGED: Вече не се ползва тук, защото self_play.py връща Material Score
+DRAW_VALUE_PENALTY = 0.0
 
 
 # ============================================================
 # WORKER: SELF-PLAY генератор
 # ============================================================
 def _worker_self_play(
-    worker_id,
-    model_state_dict,
-    sims,
-    temperature,
-    games_per_worker,
-    queue,
-    device_str="cpu",
+        worker_id,
+        model_state_dict,
+        frozen_state_dict,
+        sims,
+        temperature,
+        games_per_worker,
+        queue,
+        device_str="cpu",
 ):
     """
     Един worker:
@@ -83,6 +86,14 @@ def _worker_self_play(
         model.load_state_dict(model_state_dict)
         model.eval()
 
+        # CHANGED: Зареждаме frozen модела (Supervised)
+        frozen_model = AlphaZeroModel().to(device)
+        frozen_model.load_state_dict(frozen_state_dict)
+        frozen_model.eval()
+
+        for p in frozen_model.parameters():
+            p.requires_grad = False
+
         total_examples = []
         game_results = []
         game_lengths = []
@@ -92,9 +103,12 @@ def _worker_self_play(
             #   examples = [(state_np, pi_np, value_float), ...]
             #   result_str = "1-0" / "0-1" / "1/2-1/2"
             #   game_len = брой полуходове
+
+            # CHANGED: Подаваме frozen_model в play_episode
             examples, result_str, game_len = play_episode(
                 model=model,
                 device=device,
+                frozen_model=frozen_model,  # <-- ТУК
                 simulations=sims,
                 base_temperature=temperature,
                 verbose=False,
@@ -140,13 +154,13 @@ def _worker_self_play(
 # ============================================================
 class RLPipeline:
     def __init__(
-        self,
-        supervised_path: str = SUPERVISED_INIT_PATH,
-        rl_model_path: str = RL_MODEL_PATH,
-        optimizer_path: str = RL_OPT_PATH,
-        lr: float = 1e-4,
-        weight_decay: float = 1e-4,
-        buffer_capacity: int = 1_200_000,
+            self,
+            supervised_path: str = SUPERVISED_INIT_PATH,
+            rl_model_path: str = RL_MODEL_PATH,
+            optimizer_path: str = RL_OPT_PATH,
+            lr: float = 1e-4,
+            weight_decay: float = 1e-4,
+            buffer_capacity: int = 1_200_000,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -167,16 +181,11 @@ class RLPipeline:
         # 1) Ако имаме RL checkpoint → резюмираме RL
         if os.path.exists(self.model_path):
             try:
-                self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+                self.model.load_state_dict(
+                    torch.load(self.model_path, map_location=self.device)
+                )
                 print(f"[INFO] Loaded RL model → {self.model_path}")
-
-                if os.path.exists(self.optimizer_path):
-                    # Optimizer state зареждаме САМО ако имаме RL модел
-                    self.optimizer.load_state_dict(
-                        torch.load(self.optimizer_path, map_location=self.device)
-                    )
-                    print(f"[INFO] Loaded RL optimizer → {self.optimizer_path}")
-
+                print("[INFO] Using FRESH optimizer (intentionally reset).")
                 loaded_from = "rl"
             except Exception as e:
                 print(f"[WARN] Failed to load RL checkpoint: {e}")
@@ -231,23 +240,28 @@ class RLPipeline:
     # ---------------------------------------------------------
     # Safe model saving
     # ---------------------------------------------------------
-    def save_model(self, suffix: str = ""):
-        """
+    """
         • Без suffix → презаписва основния RL модел (alpha_zero_rl_main.pth)
         • С suffix (ep10, ep15, final...) → checkpoint в папката checkpoints/
-        """
+    """
 
+    def save_model(self, suffix: str = ""):
         if suffix == "":
-            model_path = self.model_path  # rl/checkpoints/alpha_zero_rl_main.pth
-            opt_path = self.optimizer_path  # rl/checkpoints/alpha_zero_rl_opt.pth
+            model_path = self.model_path
+            opt_path = self.optimizer_path
         else:
-            model_path = os.path.join(CHECKPOINT_DIR, f"alpha_zero_rl_checkpoint_{suffix}.pth")
-            opt_path = os.path.join(CHECKPOINT_DIR, f"alpha_zero_rl_opt_checkpoint_{suffix}.pth")
+            model_path = os.path.join(
+                CHECKPOINT_DIR, f"alpha_zero_rl_checkpoint_{suffix}.pth"
+            )
+            opt_path = os.path.join(
+                CHECKPOINT_DIR, f"alpha_zero_rl_opt_checkpoint_{suffix}.pth"
+            )
 
         torch.save(self.model.state_dict(), model_path)
         torch.save(self.optimizer.state_dict(), opt_path)
 
         self.log(f"[INFO] Saved model → {model_path}")
+        self.log(f"[INFO] Saved optimizer → {opt_path}")
 
     # ---------------------------------------------------------
     # Parallel self-play
@@ -259,6 +273,12 @@ class RLPipeline:
         # CPU-safe state dict за worker-ите
         model_state = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
 
+        # 🔒 Frozen model = supervised init (НЕ го променяме)
+        frozen_state = torch.load(
+            self.supervised_path,
+            map_location="cpu"
+        )
+
         procs = []
         for wid in range(processes):
             if torch.cuda.is_available() and torch.cuda.device_count() > 0:
@@ -268,7 +288,7 @@ class RLPipeline:
 
             p = ctx.Process(
                 target=_worker_self_play,
-                args=(wid, model_state, sims, temperature, games_per_worker, queue, device_str),
+                args=(wid, model_state, frozen_state, sims, temperature, games_per_worker, queue, device_str),
             )
             p.start()
             procs.append(p)
@@ -336,9 +356,11 @@ class RLPipeline:
             dtype=torch.float32,
         )
 
-        # Draw penalty
-        zero_mask = target_values.abs() < 1e-6
-        target_values[zero_mask] = DRAW_VALUE_PENALTY
+        # CHANGED: Премахнато хардкоднатото Draw Penalty, защото self_play.py
+        # вече връща material-based score (не нули) при реми.
+        # for i, v in enumerate(target_values):
+        #     if abs(v.item()) < 1e-6:
+        #         target_values[i] = -0.05
 
         self.model.train()
         out_policy, out_value = self.model(states_tensor)
@@ -347,7 +369,8 @@ class RLPipeline:
         log_probs = F.log_softmax(out_policy, dim=1)
         policy_loss = -torch.mean(torch.sum(target_policies * log_probs, dim=1))
         value_loss = torch.mean((out_value - target_values) ** 2)
-        loss = policy_loss + value_loss
+        # loss = policy_loss + value_loss - default
+        loss = 1.2 * policy_loss + 0.8 * value_loss  # mid state
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -378,14 +401,14 @@ class RLPipeline:
     # Main training loop
     # ---------------------------------------------------------
     def run_training(
-        self,
-        episodes=10,
-        train_steps=20,
-        batch_size=64,
-        sims=200,
-        temperature=1.0,
-        num_processes=NUM_PROCESSES,
-        games_per_worker=GAMES_PER_PROCESS,
+            self,
+            episodes=10,
+            train_steps=20,
+            batch_size=64,
+            sims=200,
+            temperature=1.0,
+            num_processes=NUM_PROCESSES,
+            games_per_worker=GAMES_PER_PROCESS,
     ):
         """
         temperature: използва се като НАЧАЛНА температура.
@@ -408,14 +431,14 @@ class RLPipeline:
 
         # Temperature schedule: линейно от temperature → final_temp
         temp_start = float(temperature)
-        #temp_final = max(0.3, temp_start * 0.25)  # напр. 1.5 → 0.375
-        temp_final = 0.70
+        # temp_final = max(0.3, temp_start * 0.25)  # напр. 1.5 → 0.375
+        temp_final = max(0.90, temp_start * 0.75)  # започва от 1.3 → пада към ~1.0
 
         # Automatic MCTS sims schedule: от sims_start → sims_end
         sims_start = int(sims)
-        #sims_end = max(int(sims * 4), sims_start + 300)  # напр. 40 → поне 300+
-        sims_end = min(sims_start + 200, 300) # максимум 300 simulations, расте леко, не експлодира
-
+        # sims_end = max(int(sims * 4), sims_start + 300)  # напр. 40 → поне 300+
+        # расте по-малко и никога не става огромно
+        sims_end = min(sims_start + 320, 400)
 
         try:
             global_step = 0
@@ -429,6 +452,10 @@ class RLPipeline:
 
                 # Температура за този епизод
                 current_temp = temp_start + (temp_final - temp_start) * progress
+
+                # Никога да не пада под разумен минимум (предпазва от реми-колапс)
+                # current_temp = max(current_temp, 1.05) - early state
+                current_temp = max(current_temp, 0.8)  # mid-state
 
                 # Sims за този епизод (нарастват с епизода)
                 current_sims = int(sims_start + (sims_end - sims_start) * progress)

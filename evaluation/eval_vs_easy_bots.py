@@ -7,7 +7,9 @@ from utils.mcts_move_selector import mcts_select_move
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "/home/presi/projects/chess_ai_project/training/rl/checkpoints/alpha_zero_rl_main.pth"
+#MODEL_PATH = "/home/presi/projects/chess_ai_project/training/rl/checkpoints/alpha_zero_rl_main.pth"
+MODEL_PATH = "/home/presi/projects/chess_ai_project/training/rl/checkpoints/alpha_zero_rl_checkpoint_ep130.pth"
+
 
 
 # ------------------------------------------------------

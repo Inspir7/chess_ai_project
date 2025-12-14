@@ -42,11 +42,11 @@ class MCTS:
         self,
         model,
         device,
-        simulations=200,
-        c_puct=1.2,
+        simulations=160,
+        c_puct=3.0,  # CHANGED: Увеличено от 1.6 на 3.0 за разбиване на ремитата
         dirichlet_alpha=0.3,
-        dirichlet_epsilon=0.25,
-        batch_size=16,  # вече не се ползва, оставям го за съвместимост
+        dirichlet_epsilon=0.25, # Леко намален epsilon (стандартно е 0.25)
+        batch_size=16,  # вече не се ползва
     ):
         """
         model: AlphaZero policy-value network
@@ -65,6 +65,9 @@ class MCTS:
 
         self.total_moves = get_total_move_count()
 
+        # FIX: пазим последния root за debug / run_with_Q
+        self.last_root = None
+
     # =====================================================
     # Public Interface
     # =====================================================
@@ -74,8 +77,11 @@ class MCTS:
         """
         root = MCTSNode(root_board.copy(stack=False))
 
+        # FIX: запазваме root-а (за run_with_Q и дебъг)
+        self.last_root = root
+
         # Първоначална експанзия на root (NN + деца)
-        value_root = self._evaluate_and_expand(root)
+        _ = self._evaluate_and_expand(root)
 
         # добавяме Dirichlet noise веднъж в началото (opening)
         self._apply_dirichlet_noise(root, move_number)
@@ -125,7 +131,6 @@ class MCTS:
 
         legal = list(board.legal_moves)
         if not legal:
-            # няма легални ходове, но не е маркирано като game_over (рядко)
             node.is_expanded = True
             return 0.0
 
@@ -144,7 +149,6 @@ class MCTS:
         # --------- Neural net inference ---------
         with torch.no_grad():
             policy_logits, value = self.model(state_tensor)
-            # value: скалар в [-1,1], от гледна точка на ИГРАЧА НА ХОД (както сме тренирали)
             value = float(value.item())
             policy = F.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
 
@@ -152,14 +156,30 @@ class MCTS:
         node.is_expanded = True
         node.children = {}
 
+        priors = []
+        moves_kept = []
+
         for mv in legal:
             idx = move_to_index(mv)
             if idx is None or idx < 0 or idx >= self.total_moves:
                 continue
             p = float(policy[idx])
-            child_board = board.copy(stack=False)
-            child_board.push(mv)
-            node.children[mv] = MCTSNode(child_board, parent=node, prior=p)
+            priors.append(p)
+            moves_kept.append(mv)
+
+        # FIX (важно): ако има валидни индекси, ренормализирай prior-ите само върху легалните
+        if moves_kept:
+            priors = np.asarray(priors, dtype=np.float32)
+            psum = float(priors.sum())
+            if psum <= 1e-12:
+                priors = np.ones_like(priors) / len(priors)
+            else:
+                priors = priors / psum
+
+            for mv, p in zip(moves_kept, priors):
+                child_board = board.copy(stack=False)
+                child_board.push(mv)
+                node.children[mv] = MCTSNode(child_board, parent=node, prior=float(p))
 
         # safety fallback – ако по някаква причина всичко е skip-нато
         if not node.children:
@@ -192,6 +212,12 @@ class MCTS:
         for mv, n in zip(moves, noise):
             child = root.children[mv]
             child.prior = (1.0 - eps) * child.prior + eps * float(n)
+
+        # FIX (по желание, но е добре): ренормализация след noise
+        s = sum(ch.prior for ch in root.children.values())
+        if s > 1e-12:
+            for ch in root.children.values():
+                ch.prior /= s
 
     # =====================================================
     # Selection (PUCT)
@@ -249,3 +275,25 @@ class MCTS:
             probs = visits / visits.sum()
 
         return {mv: float(p) for mv, p in zip(moves, probs)}
+
+    # =====================================================
+    # Debug: π + Q-values at root
+    # =====================================================
+    def run_with_Q(self, board, move_number=None):
+        """
+        Връща:
+          pi: {move: prob} по visit-counts
+          Q : {move: q_value} средна стойност на детето
+        """
+        pi = self.run(board, move_number)
+
+        root = self.last_root  # FIX: реалния root от последния run
+        Q = {}
+        if root is not None and root.children:
+            for move, child in root.children.items():
+                Q[move] = float(child.q_value)
+        else:
+            for move in pi.keys():
+                Q[move] = 0.0
+
+        return pi, Q
