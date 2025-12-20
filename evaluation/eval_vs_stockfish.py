@@ -1,241 +1,134 @@
-import os
 import sys
-import math
-import time
-
+import os
 import chess
 import chess.engine
 import torch
+import numpy as np
+import math
 
-# ==============================
-# Python path → project root
-# ==============================
+# ==========================
+# SETUP PATHS
+# ==========================
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from models.AlphaZero import AlphaZeroModel
-from utils.mcts_move_selector import mcts_select_move
+from training.mcts import MCTS
 
-
-# ==============================
-# Пътища
-# ==============================
-BASE_DIR = PROJECT_ROOT
-TRAINING_DIR = os.path.join(BASE_DIR, "training")
-
-RL_CHECKPOINT = os.path.join(
-    TRAINING_DIR, "rl", "checkpoints", "alpha_zero_rl_main.pth"
-)
-
-# !! Тук слагаме реалния път до Stockfish (ти вече показа which stockfish → /usr/games/stockfish)
+# ==========================
+# CONFIG
+# ==========================
+MODEL_PATH = os.path.join(PROJECT_ROOT, "training/rl/checkpoints/alpha_zero_rl_checkpoint_final.pth")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 STOCKFISH_PATH = "/usr/games/stockfish"
 
 
-# ==============================
-# Зареждане на модела
-# ==============================
-def load_model(device: torch.device):
-    print(f"[INFO] Loading model from {RL_CHECKPOINT}")
-    model = AlphaZeroModel().to(device)
-    state_dict = torch.load(RL_CHECKPOINT, map_location=device)
-    model.load_state_dict(state_dict)
-    model.eval()
-    return model
+def get_ai_move(model, board, simulations=800):
+    mcts = MCTS(
+        model,
+        DEVICE,
+        simulations=simulations,
+        dirichlet_epsilon=0.0,
+        c_puct=1.5
+    )
+
+    # Лъжем MCTS, че е средата на играта
+    pi = mcts.run(board, move_number=100)
+
+    moves = list(pi.keys())
+    probs = list(pi.values())
+
+    if not moves: return None
+    best_idx = np.argmax(probs)
+    return moves[best_idx]
 
 
-# ==============================
-# Една партия AlphaZero vs Stockfish
-# ==============================
-def play_single_game(
-    model,
-    engine: chess.engine.SimpleEngine,
-    device: torch.device,
-    stockfish_skill: int = 0,
-    simulations: int = 200,
-    max_moves: int = 160,
-    alphazero_is_white: bool = True,
-):
-    """
-    Връща:
-      result_str: "1-0" / "0-1" / "1/2-1/2"
-      score: резултат от гледна точка на AlphaZero (1, 0.5, 0)
-    """
+def play_match(model, engine, limit_type, ai_color):
     board = chess.Board()
 
-    # Настройка на Stockfish
-    engine.configure({"Skill Level": stockfish_skill})
+    # Тук вече не ползваме Elo настройките, а подаваме лимита директно при хода
+    # engine.configure(...) - не е нужно за depth limit
 
-    ply = 0
+    color_name = "White" if ai_color == chess.WHITE else "Black"
+    print(f"   ⚔️  AI ({color_name}) vs Stockfish ({limit_type})")
 
-    while not board.is_game_over() and ply < max_moves:
-        to_move_is_white = board.turn == chess.WHITE
-        alphazero_to_move = (to_move_is_white and alphazero_is_white) or (
-            (not to_move_is_white) and (not alphazero_is_white)
-        )
-
-        if alphazero_to_move:
-            # Ход на AlphaZero чрез MCTS
-            move = mcts_select_move(
-                model=model,
-                board=board,
-                device=device,
-                simulations=simulations,
-                ply=ply,
-            )
-
-            if move is None:
-                # Няма ход → губим
-                break
-
+    moves_count = 0
+    while not board.is_game_over() and moves_count < 150:
+        if board.turn == ai_color:
+            # AI
+            move = get_ai_move(model, board, simulations=400)
+            if move is None or move not in board.legal_moves:
+                return 0.0  # Loss
             board.push(move)
         else:
-            # Ход на Stockfish
-            try:
-                # Леко ограничение – да не мисли твърде дълго
-                # depth=8 е разумен компромис за skill 0–1
-                result = engine.play(board, chess.engine.Limit(depth=8))
-                if result.move is None:
-                    break
-                board.push(result.move)
-            except chess.engine.EngineTerminatedError:
-                print("[ERROR] Stockfish engine terminated unexpectedly.")
-                break
-            except chess.engine.EngineError as e:
-                print(f"[ERROR] Stockfish error: {e}")
-                break
+            # STOCKFISH - СИЛАТА СЕ ОПРЕДЕЛЯ ТУК
+            if limit_type == "Depth 1":
+                limit = chess.engine.Limit(depth=1)
+            elif limit_type == "Depth 2":
+                limit = chess.engine.Limit(depth=2)
+            else:
+                limit = chess.engine.Limit(time=0.1)  # Skill 0 standard
 
-        ply += 1
+            result = engine.play(board, limit)
+            board.push(result.move)
 
-    # Финален резултат
-    if board.is_game_over():
-        res = board.result()
-    else:
-        # Ако стигнем max_moves без резултат → реми
-        res = "1/2-1/2"
+        moves_count += 1
+        if moves_count % 30 == 0: print(f"      Move {moves_count}...")
 
-    # Пресмятаме резултат от гледна точка на AlphaZero
+    res = board.result()
+    print(f"      🏁 Result: {res} (Moves: {moves_count})")
+
     if res == "1-0":
-        score_white = 1.0
+        return 1.0 if ai_color == chess.WHITE else 0.0
     elif res == "0-1":
-        score_white = 0.0
+        return 1.0 if ai_color == chess.BLACK else 0.0
     else:
-        score_white = 0.5
-
-    if alphazero_is_white:
-        score_az = score_white
-    else:
-        score_az = 1.0 - score_white if res in ["1-0", "0-1"] else 0.5
-
-    return res, score_az
+        return 0.5
 
 
-# ==============================
-# Серия партии на дадено ниво
-# ==============================
-def evaluate_vs_stockfish_level(
-    model,
-    device: torch.device,
-    stockfish_skill: int,
-    num_games: int = 10,
-    simulations: int = 200,
-    max_moves: int = 160,
-):
-    """
-    Играем num_games партии срещу Stockfish на даден skill.
-    Редуваме цветове (бяла/черна) за AlphaZero.
-    Връща:
-      avg_score: среден резултат от гледна точка на AlphaZero
-      elo_diff: приблизителна Elo разлика (AlphaZero – Stockfish)
-    """
+def run_elo_benchmark():
+    if not os.path.exists(MODEL_PATH):
+        print("Model not found");
+        return
+
+    print(f"🤖 Loading AlphaZero Model...")
+    model = AlphaZeroModel().to(DEVICE)
     try:
-        engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
-    except FileNotFoundError:
-        print(f"[ERROR] Stockfish binary not found at: {STOCKFISH_PATH}")
-        sys.exit(1)
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    except:
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
 
-    scores = []
+    engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
 
-    try:
-        for game_idx in range(1, num_games + 1):
-            alphazero_is_white = (game_idx % 2 == 1)
+    # ТЕСТВАМЕ ПО ДЪЛБОЧИНА (Depth) вместо ELO
+    # Depth 1 ~= 400-600 ELO
+    # Depth 2 ~= 800-1000 ELO
+    levels = ["Depth 1", "Depth 2"]
 
-            print(
-                f"Game {game_idx}/{num_games} "
-                f"(AZ as {'White' if alphazero_is_white else 'Black'}): ",
-                end="",
-                flush=True,
-            )
-
-            res, score = play_single_game(
-                model=model,
-                engine=engine,
-                device=device,
-                stockfish_skill=stockfish_skill,
-                simulations=simulations,
-                max_moves=max_moves,
-                alphazero_is_white=alphazero_is_white,
-            )
-
-            scores.append(score)
-            outcome_char = "W" if score == 1.0 else ("D" if score == 0.5 else "L")
-            print(f"{outcome_char} ({res})")
-
-    finally:
-        engine.quit()
-
-    if not scores:
-        return 0.0, None
-
-    avg_score = sum(scores) / len(scores)
-
-    # Приблизителна Elo разлика:
-    # p = score за AlphaZero; elo_diff = -400 * log10(1/p - 1)
-    # (ако p=0 или 1 → clamp-ваме)
-    p = max(0.01, min(0.99, avg_score))
-    elo_diff = -400.0 * math.log10(1.0 / p - 1.0)
-
-    return avg_score, elo_diff
-
-
-# ==============================
-# MAIN
-# ==============================
-def main():
-    print("\n==============================")
-    print(" AlphaZero vs Stockfish Evaluation")
-    print("==============================")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 1) Зареждаме RL модела
-    model = load_model(device)
-
-    # Конфигурация
-    simulations = 200     # MCTS simulations per move
-    max_moves = 160       # лимит на полуходове
-    num_games_per_level = 10
-
-    # Нива на Stockfish за тест – можеш да добавиш [2,3,...]
-    levels = [0, 1]
+    print("\n===========================================")
+    print("🚀 STARTING STOCKFISH DEPTH BENCHMARK")
+    print("===========================================")
 
     for lvl in levels:
-        print(f"\n=== Stockfish Skill {lvl} ===")
-        avg_score, elo_diff = evaluate_vs_stockfish_level(
-            model=model,
-            device=device,
-            stockfish_skill=lvl,
-            num_games=num_games_per_level,
-            simulations=simulations,
-            max_moves=max_moves,
-        )
+        print(f"\n--- Testing vs Stockfish {lvl} ---")
 
-        print(f"→ Avg score vs skill {lvl}: {avg_score:.3f}")
-        if elo_diff is None:
-            print("→ Elo difference: N/A (no games)")
+        score_w = play_match(model, engine, lvl, chess.WHITE)
+        score_b = play_match(model, engine, lvl, chess.BLACK)
+
+        total = score_w + score_b
+        print(f"📊 Score vs {lvl}: {total}/2.0")
+
+        if total > 0.5:
+            print(f"✅ AI can compete at {lvl}!")
         else:
-            print(f"→ Approx ELO difference (AZ - SF): {elo_diff:.1f}")
+            print(f"⚠️ AI struggling at {lvl}.")
+            break
+
+    engine.quit()
 
 
 if __name__ == "__main__":
-    main()
+    run_elo_benchmark()

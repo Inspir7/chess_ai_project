@@ -1,5 +1,3 @@
-# training/move_encoding.py
-
 import chess
 
 # ============================================================
@@ -18,8 +16,8 @@ TOTAL_MOVES = 4672
 PROMOTION_MAP = {
     chess.KNIGHT: 0,
     chess.BISHOP: 1,
-    chess.ROOK:   2,
-    chess.QUEEN:  3,
+    chess.ROOK: 2,
+    chess.QUEEN: 3,
 }
 
 REVERSE_PROMO = {
@@ -31,16 +29,13 @@ REVERSE_PROMO = {
 
 
 # ============================================================
-# MOVE → INDEX
-# (MUST remain identical to generate_labeled_data)
+# MOVE -> INDEX
 # ============================================================
 
 def move_to_index(move: chess.Move) -> int:
     """
     Convert chess.Move into index 0..4671.
-    100% consistent with generate_labeled_data.py
     """
-
     from_sq = move.from_square
     to_sq = move.to_square
 
@@ -55,7 +50,7 @@ def move_to_index(move: chess.Move) -> int:
 
 
 # ============================================================
-# INDEX → MOVE  (Debug use only)
+# INDEX -> MOVE  (Debug use only)
 # ============================================================
 
 def index_to_move(index: int) -> chess.Move | None:
@@ -68,52 +63,53 @@ def index_to_move(index: int) -> chess.Move | None:
         promo_type = offset // 64
         to_sq = offset % 64
         promo = REVERSE_PROMO.get(promo_type, chess.QUEEN)
+        # Cannot reconstruct from-square exactly without board context in this scheme
+        # but for flipping logic we don't strictly need it if we calculate mathematically
+        return None
 
-        # Cannot reconstruct from-square without board context
-        return chess.Move(None, to_sq, promotion=promo)
-
-    # Normal move
+        # Normal move
     from_sq = index // 64
-    to_sq   = index % 64
+    to_sq = index % 64
     return chess.Move(from_sq, to_sq)
 
 
 # ============================================================
-# GEOMETRICAL FLIP FOR DATA AUGMENTATION
+# 180-DEGREE FLIP (CANONICAL)
 # ============================================================
-
-def flip_square(sq: int) -> int:
-    """
-    Mirror horizontally (a <-> h).
-    Works on 0..63.
-    """
-    rank = sq // 8
-    file = sq % 8
-    file_flipped = 7 - file
-    return rank * 8 + file_flipped
-
 
 def flip_move_index(idx: int) -> int:
     """
-    Mirror a move index over the vertical axis.
-    Works for both normal moves and promotions.
+    Mirror a move index over the CENTER (180 degrees rotation).
+    This matches the logic: board.transform(chess.flip_vertical).transform(chess.flip_horizontal)
+
+    Logic:
+    Square 0 (a1) <-> Square 63 (h8)
+    Formula: new_sq = 63 - old_sq
     """
 
-    # Promotion moves
+    # ---------------------------
+    # A) PROMOTION MOVES
+    # ---------------------------
     if idx >= 4096:
         offset = idx - 4096
-        promo_type = offset // 64  # 0..3
+        promo_type = offset // 64  # 0..3 (Knight..Queen)
         to_sq = offset % 64
 
-        new_to = flip_square(to_sq)
+        # 180 rotation for destination square
+        new_to = 63 - to_sq
+
+        # Reconstruct index
         return 4096 + promo_type * 64 + new_to
 
-    # Normal move
+    # ---------------------------
+    # B) NORMAL MOVES
+    # ---------------------------
     from_sq = idx // 64
     to_sq = idx % 64
 
-    new_from = flip_square(from_sq)
-    new_to   = flip_square(to_sq)
+    # 180 rotation
+    new_from = 63 - from_sq
+    new_to = 63 - to_sq
 
     return new_from * 64 + new_to
 
@@ -124,7 +120,6 @@ def flip_move_index(idx: int) -> int:
 
 def get_total_move_count() -> int:
     return TOTAL_MOVES
-
 
 # Quick test
 if __name__ == "__main__":

@@ -299,7 +299,7 @@ class RLPipeline:
             data = queue.get()
 
             if data["error"]:
-                print(("[WORKER ERROR] → {data['error']}"))
+                print(f"[WORKER ERROR] → {data['error']}")
                 continue
 
             all_examples.extend(data["examples"])
@@ -488,8 +488,14 @@ class RLPipeline:
                 # Статистика за игрите + Elo proxy
                 if results:
                     draws = results.count("1/2-1/2")
-                    whites = results.count("1-0")
-                    blacks = results.count("0-1")
+                    # Старо (грешно за новите надписи):
+                    # whites = results.count("1-0")
+                    # blacks = results.count("0-1")
+
+                    # НОВО (работи и с "1-0" и с "1-0 (Adj)"):
+                    whites = sum(1 for r in results if r.startswith("1-0"))
+                    blacks = sum(1 for r in results if r.startswith("0-1"))
+
                     avg_len = float(np.mean(lengths))
                     total_games = len(results)
 
@@ -574,14 +580,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run AlphaZero RL Training Pipeline")
 
-    parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--train_steps", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--sims", type=int, default=40)
+    parser.add_argument("--episodes", type=int, default=50)
+    parser.add_argument("--train_steps", type=int, default=40)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--sims", type=int, default=100)
     parser.add_argument(
         "--temperature",
         type=float,
-        default=1.50,
+        default=1.20,
         help="Начална температура за self-play; ще се намаля линейно към по-ниска.",
     )
     parser.add_argument("--processes", type=int, default=NUM_PROCESSES)

@@ -1,165 +1,240 @@
-# data/generate_labeled_data.py
-
 import sqlite3
 import numpy as np
 import chess
-import chess.pgn
 import random
 import multiprocessing
 import time
+import os
 
 from training.move_encoding import move_to_index, get_total_move_count
 
 TOTAL_MOVES = get_total_move_count()
 
+
 # ============================================================
-# GAME PHASE (same as before)
+# 1. HELPER FUNCTIONS
 # ============================================================
 
 def determine_phase(board):
+    """Определя фазата на играта (0=Opening, 1=Mid, 2=End)"""
     piece_values = {'p': 1, 'n': 3, 'b': 3, 'r': 5, 'q': 9, 'k': 0}
     total_value = sum(piece_values[piece.symbol().lower()] for piece in board.piece_map().values())
     if total_value > 20:
-        return 0  # opening
+        return 0
     elif total_value > 10:
-        return 1  # middlegame
+        return 1
     else:
-        return 2  # endgame
+        return 2
 
-# ============================================================
-# VALUE LABEL (same as before)
-# ============================================================
 
-def evaluate_position(board, result_str):
-    if result_str == "1-0":
-        return 1.0 if board.turn == chess.WHITE else -1.0
-    elif result_str == "0-1":
-        return -1.0 if board.turn == chess.WHITE else 1.0
+def get_canonical_data(board, next_move):
+    """
+    Помощна функция за Supervised Learning.
+    Връща завъртяна дъска и завъртян ход.
+    """
+    if board.turn == chess.WHITE:
+        return board, next_move
     else:
-        return 0.0
+        # Завъртаме дъската
+        board_flipped = board.transform(chess.flip_vertical)
+        board_flipped = board_flipped.transform(chess.flip_horizontal)
 
-# ============================================================
-# FEN → (8x8x15)
-# ============================================================
+        # Завъртаме и хода
+        if next_move:
+            def flip_square(sq):
+                return chess.square(7 - chess.square_file(sq), 7 - chess.square_rank(sq))
 
-def fen_to_tensor(fen):
-    board = chess.Board(fen)
+            from_sq = flip_square(next_move.from_square)
+            to_sq = flip_square(next_move.to_square)
+            move_flipped = chess.Move(from_sq, to_sq, promotion=next_move.promotion)
+            return board_flipped, move_flipped
+
+        return board_flipped, None
+
+
+def fen_to_tensor(input_data):
+    """
+    Приема chess.Board или FEN.
+    Връща (8,8,15) тензор.
+    АВТОМАТИЧНО ЗАВЪРТА ДЪСКАТА (Fix за RL "Suicide" bug).
+    """
+    # 1. Input Check
+    if isinstance(input_data, str):
+        board = chess.Board(input_data)
+    else:
+        board = input_data
+
+    # 2. PERSPECTIVE FLIP (Липсваше в твоя код!)
+    # Ако е ред на черните, обръщаме дъската, за да изглежда като за бели
+    if board.turn == chess.BLACK:
+        board = board.transform(chess.flip_vertical)
+        board = board.transform(chess.flip_horizontal)
+
+    # Mapping
     piece_map = {
         'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
         'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
     }
     tensor = np.zeros((8, 8, 15), dtype=np.float32)
 
-    # pieces
     for square, piece in board.piece_map().items():
         x, y = divmod(square, 8)
         tensor[7 - x, y, piece_map[piece.symbol()]] = 1.0
 
-    # side to move
-    tensor[:, :, 12] = 1.0 if board.turn == chess.WHITE else 0.0
-
-    # normalized move number
+    tensor[:, :, 12] = 1.0
     tensor[:, :, 13] = board.fullmove_number / 100.0
-
-    # game phase
     tensor[:, :, 14] = determine_phase(board)
 
     return tensor
 
-# ============================================================
-# POLICY LABEL (NOW USING NEW move_encoding.py)
-# ============================================================
 
-def build_policy_vector(board, result_str):
-    """
-    Builds a policy vector (4672,) using the *exact same* move_to_index
-    function that RL + MCTS use.
-    """
-    legal_moves = list(board.legal_moves)
-    policy = np.zeros(TOTAL_MOVES, dtype=np.float32)
+def get_value_target(result_str, original_turn):
+    if result_str == "1-0":
+        winner = chess.WHITE
+    elif result_str == "0-1":
+        winner = chess.BLACK
+    else:
+        return 0.0
 
-    if not legal_moves:
-        return policy
+    if winner == original_turn:
+        return 1.0
+    else:
+        return -1.0
 
-    # For supervised we use ONE random legal move (same as before),
-    # but encoded with the NEW MOVE ENCODING.
-    move = random.choice(legal_moves)
-    idx = move_to_index(move)
-
-    if 0 <= idx < TOTAL_MOVES:
-        policy[idx] = 1.0
-
-    return policy
 
 # ============================================================
-# FULL SAMPLE BUILDER
+# 2. GAME PROCESSOR (WORKER)
 # ============================================================
 
-def fen_to_tensor_with_labels(row):
-    fen, result = row
-    board = chess.Board(fen)
+def process_game(row):
+    """Обработва ЕДНА игра."""
+    moves_uci_str, result_str = row
+    if not moves_uci_str: return []
 
-    state = fen_to_tensor(fen)                    # (8,8,15)
-    policy = build_policy_vector(board, result)   # (4672)
-    value = evaluate_position(board, result)      # float
+    board = chess.Board()
+    samples = []
 
-    return state, policy, value
+    try:
+        moves = moves_uci_str.split()
+        for move_str in moves:
+            next_move = chess.Move.from_uci(move_str)
+
+            original_turn = board.turn
+
+            # ВАЖНО: Тук променяме логиката, за да не завъртаме два пъти!
+
+            # А) За POLICY (Target) ни трябва завъртяният ход:
+            _, canon_move = get_canonical_data(board, next_move)
+
+            # Б) За TENSOR (Input) подаваме СУРОВАТА дъска на fen_to_tensor
+            # (Тя вече сама ще си я завърти вътре)
+            state_tensor = fen_to_tensor(board)
+
+            # Create Policy Vector
+            policy_vector = np.zeros(TOTAL_MOVES, dtype=np.float32)
+            idx = move_to_index(canon_move)
+            if 0 <= idx < TOTAL_MOVES:
+                policy_vector[idx] = 1.0
+
+            # Value Target
+            value_target = get_value_target(result_str, original_turn)
+
+            samples.append((state_tensor, policy_vector, value_target))
+            board.push(next_move)
+
+    except ValueError:
+        pass
+
+    return samples
+
 
 # ============================================================
-# PARALLEL PROCESSING PIPELINE
+# 3. PARALLEL MANAGER
 # ============================================================
 
-def parallel_process_labeled(fen_rows, filename, num_workers=8, batch_size=10000):
-    num_batches = len(fen_rows) // batch_size + (1 if len(fen_rows) % batch_size else 0)
+def save_batch(samples, folder_path, prefix, batch_idx):
+    if not samples: return
+    states, policies, values = zip(*samples)
 
-    print(f"Processing {filename} with {num_workers} workers...")
-    start_time = time.time()
+    path_states = os.path.join(folder_path, f"{prefix}_states_{batch_idx}.npy")
+    path_policies = os.path.join(folder_path, f"{prefix}_policies_{batch_idx}.npy")
+    path_values = os.path.join(folder_path, f"{prefix}_values_{batch_idx}.npy")
 
-    with multiprocessing.Pool(num_workers) as pool:
-        for i in range(num_batches):
-            batch = fen_rows[i * batch_size:(i + 1) * batch_size]
-            print(f"Batch {i + 1}/{num_batches} ({len(batch)} samples)...")
+    np.save(path_states, np.array(states, dtype=np.float32))
+    np.save(path_policies, np.array(policies, dtype=np.float32))
+    np.save(path_values, np.array(values, dtype=np.float32))
 
-            results = pool.map(fen_to_tensor_with_labels, batch)
+    print(f"  -> Saved batch {batch_idx} in '{folder_path}' ({len(samples)} pos)")
 
-            states, policies, values = zip(*results)
 
-            np.save(f"{filename}_states_{i}.npy",  np.array(states, dtype=np.float32))
-            np.save(f"{filename}_policies_{i}.npy", np.array(policies, dtype=np.float32))
-            np.save(f"{filename}_values_{i}.npy",   np.array(values, dtype=np.float32))
+def parallel_process_games(rows, output_folder, file_prefix, num_workers=6, games_per_chunk=1000):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"Created directory: {output_folder}")
 
-            print(f"Saved → {filename}_states_{i}.npy etc.")
+    print(f"Starting processing for '{file_prefix}' -> {output_folder} ...")
 
-    print(f"Finished {filename} in {time.time() - start_time:.2f} seconds.")
+    pool = multiprocessing.Pool(num_workers)
+    total_samples_buffer = []
+    batch_counter = 0
+
+    for i in range(0, len(rows), games_per_chunk):
+        chunk = rows[i: i + games_per_chunk]
+        results = pool.map(process_game, chunk)
+
+        for game_samples in results:
+            total_samples_buffer.extend(game_samples)
+
+        if len(total_samples_buffer) >= 50000:
+            save_batch(total_samples_buffer, output_folder, file_prefix, batch_counter)
+            total_samples_buffer = []
+            batch_counter += 1
+
+    if total_samples_buffer:
+        save_batch(total_samples_buffer, output_folder, file_prefix, batch_counter)
+
+    pool.close()
+    pool.join()
+
 
 # ============================================================
-# MAIN
+# 4. MAIN
 # ============================================================
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
-    print("Loading FEN positions from database...")
-    conn = sqlite3.connect("/home/presi/projects/chess_ai_project/data/datachess_games.db")
+    PROJECT_ROOT = "/home/presi/projects/chess_ai_project"
+    DB_PATH = os.path.join(PROJECT_ROOT, "data/datachess_games.db")
+
+    TRAIN_DIR = os.path.join(PROJECT_ROOT, "data/processed/train")
+    VAL_DIR = os.path.join(PROJECT_ROOT, "data/processed/val")
+    TEST_DIR = os.path.join(PROJECT_ROOT, "data/processed/test")
+
+    print(f"Reading games from {DB_PATH}...")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT fen, result FROM games")
-    fen_rows = cursor.fetchall()
+
+    cursor.execute("SELECT moves_uci, result FROM games WHERE moves_uci IS NOT NULL LIMIT 20000")
+
+    rows = cursor.fetchall()
     conn.close()
 
-    print(f"Total positions: {len(fen_rows)}")
-    random.shuffle(fen_rows)
+    print(f"Loaded {len(rows)} games total.")
+    random.shuffle(rows)
 
-    train_size = int(0.8 * len(fen_rows))
-    val_size   = int(0.1 * len(fen_rows))
+    n = len(rows)
+    train_end = int(0.8 * n)
+    val_end = int(0.9 * n)
 
-    train_rows = fen_rows[:train_size]
-    val_rows   = fen_rows[train_size:train_size + val_size]
-    test_rows  = fen_rows[train_size + val_size:]
+    train_games = rows[:train_end]
+    val_games = rows[train_end:val_end]
+    test_games = rows[val_end:]
 
-    print(f"Split: Train={len(train_rows)}, Val={len(val_rows)}, Test={len(test_rows)}")
+    print(f"Splitting data: Train={len(train_games)}, Val={len(val_games)}, Test={len(test_games)}")
 
-    parallel_process_labeled(train_rows, "train_labeled")
-    parallel_process_labeled(val_rows,   "val_labeled",  batch_size=5000)
-    parallel_process_labeled(test_rows,  "test_labeled", batch_size=5000)
+    parallel_process_games(train_games, TRAIN_DIR, "train")
+    parallel_process_games(val_games, VAL_DIR, "val")
+    parallel_process_games(test_games, TEST_DIR, "test")
 
-    print("All labeled .npy files saved successfully!")
+    print("\n✅ READY! All data generated correctly.")

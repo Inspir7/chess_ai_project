@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import chess
 
 from data.generate_labeled_data import fen_to_tensor
-from training.move_encoding import move_to_index, get_total_move_count
+from training.move_encoding import move_to_index, get_total_move_count, flip_move_index
 
 
 # =====================================================
@@ -34,7 +34,7 @@ class MCTSNode:
 
 
 # =====================================================
-# MCTS (AlphaZero-style, без batch усложнения)
+# MCTS (AlphaZero-style)
 # =====================================================
 
 class MCTS:
@@ -43,18 +43,11 @@ class MCTS:
         model,
         device,
         simulations=160,
-        c_puct=3.0,  # CHANGED: Увеличено от 1.6 на 3.0 за разбиване на ремитата
+        c_puct=3.0,
         dirichlet_alpha=0.3,
-        dirichlet_epsilon=0.25, # Леко намален epsilon (стандартно е 0.25)
-        batch_size=16,  # вече не се ползва
+        dirichlet_epsilon=0.25,
+        batch_size=16,  # запазваме аргумента, макар да не се ползва
     ):
-        """
-        model: AlphaZero policy-value network
-        device: torch.device
-        simulations: брой MCTS симулации за ход
-        c_puct: коефициент за баланс exploration / exploitation
-        dirichlet_*: параметри за root noise (само на корена)
-        """
         self.model = model
         self.device = device
         self.simulations = simulations
@@ -64,8 +57,6 @@ class MCTS:
         self.dirichlet_epsilon = dirichlet_epsilon
 
         self.total_moves = get_total_move_count()
-
-        # FIX: пазим последния root за debug / run_with_Q
         self.last_root = None
 
     # =====================================================
@@ -73,137 +64,106 @@ class MCTS:
     # =====================================================
     def run(self, root_board, move_number=None):
         """
-        Стартира MCTS търсене и връща dict {move: prob} (π по visit count-ове).
+        Стартира MCTS търсене и връща dict {move: prob}.
         """
         root = MCTSNode(root_board.copy(stack=False))
-
-        # FIX: запазваме root-а (за run_with_Q и дебъг)
         self.last_root = root
 
-        # Първоначална експанзия на root (NN + деца)
+        # 1. Expand Root
         _ = self._evaluate_and_expand(root)
 
-        # добавяме Dirichlet noise веднъж в началото (opening)
+        # 2. Add Noise
         self._apply_dirichlet_noise(root, move_number)
 
-        # Основен loop: една симулация = selection → expansion → backup
+        # 3. Main Loop
         for _ in range(self.simulations):
             node = root
             path = [node]
 
-            # Selection: слизаме по дървото според PUCT,
-            # докато стигнем неекспандиран node или терминален
+            # Select
             while node.is_expanded and node.children:
                 move, node = self._select_child(node)
                 path.append(node)
 
-            # Expansion + NN оценка
+            # Expand & Eval
             value = self._evaluate_and_expand(node)
 
-            # Backup (flip на знака по пътя)
+            # Backup
             self._backup(path, value)
 
         return self._compute_root_policy(root)
 
     # =====================================================
-    # Evaluate + Expand (single node)
+    # Evaluate + Expand (CRITICAL FIXES HERE)
     # =====================================================
     def _evaluate_and_expand(self, node):
-        """
-        Оценява node с мрежата и го експандира (ако не е терминален).
-        Връща value от гледна точка на ИГРАЧА НА ХОД в този node.
-        """
         board = node.board
 
-        # --------- Терминален случай ---------
+        # Проверка за край на играта
         if board.is_game_over():
-            res = board.result()
-            # value винаги от гледна точка на играча на ход
-            if res == "1-0":      # бели са победили
-                value = 1.0 if board.turn == chess.WHITE else -1.0
-            elif res == "0-1":    # черни са победили
-                value = 1.0 if board.turn == chess.BLACK else -1.0
-            else:
-                value = 0.0
-
-            node.is_expanded = True  # няма деца
-            return value
-
-        legal = list(board.legal_moves)
-        if not legal:
-            node.is_expanded = True
+            result = board.result()
+            # Връщаме резултата от гледна точка на текущия играч на хода
+            if result == "1-0": return 1.0 if board.turn == chess.WHITE else -1.0
+            if result == "0-1": return 1.0 if board.turn == chess.BLACK else -1.0
             return 0.0
 
-        # --------- Encode state ---------
-        s = fen_to_tensor(board.fen())
-        s = np.asarray(s, dtype=np.float32)
+        # 1. INPUT
+        state_tensor = fen_to_tensor(board)
+        state_tensor = torch.tensor(state_tensor, dtype=torch.float32).unsqueeze(0)
+        state_tensor = state_tensor.permute(0, 3, 1, 2).to(self.device)
 
-        # HWC → CHW
-        if s.shape == (8, 8, 15):
-            s = s.transpose(2, 0, 1)
-        elif s.shape != (15, 8, 8):
-            s = s.reshape(15, 8, 8)
-
-        state_tensor = torch.from_numpy(s).unsqueeze(0).to(self.device)
-
-        # --------- Neural net inference ---------
+        # 2. INFERENCE
+        self.model.eval()
         with torch.no_grad():
             policy_logits, value = self.model(state_tensor)
-            value = float(value.item())
-            policy = F.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
 
-        # --------- Експанзия: деца с prior-и ---------
+        leaf_value = value.item()
+        policy_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
+
+        # 3. OUTPUT FLIP (FIXED)
+        if board.turn == chess.BLACK:
+            fixed_policy = np.zeros_like(policy_probs)
+            for i in range(len(policy_probs)):
+                if policy_probs[i] > 1e-8: # лека оптимизация
+                    mirror_idx = flip_move_index(i)
+                    if mirror_idx < len(fixed_policy):
+                        fixed_policy[mirror_idx] = policy_probs[i]
+            policy_probs = fixed_policy
+
+        # 4. EXPAND (FIXED CONSTRUCTOR)
+        legal_moves = list(board.legal_moves)
+        policy_sum = 0
         node.is_expanded = True
-        node.children = {}
 
-        priors = []
-        moves_kept = []
+        for move in legal_moves:
+            idx = move_to_index(move)
+            if idx is not None and 0 <= idx < len(policy_probs):
+                prior = policy_probs[idx]
 
-        for mv in legal:
-            idx = move_to_index(mv)
-            if idx is None or idx < 0 or idx >= self.total_moves:
-                continue
-            p = float(policy[idx])
-            priors.append(p)
-            moves_kept.append(mv)
+                if move not in node.children:
+                    # FIX: Създаваме нова дъска и я подаваме на конструктора
+                    next_board = board.copy()
+                    next_board.push(move)
+                    node.children[move] = MCTSNode(next_board, parent=node, prior=prior)
 
-        # FIX (важно): ако има валидни индекси, ренормализирай prior-ите само върху легалните
-        if moves_kept:
-            priors = np.asarray(priors, dtype=np.float32)
-            psum = float(priors.sum())
-            if psum <= 1e-12:
-                priors = np.ones_like(priors) / len(priors)
-            else:
-                priors = priors / psum
+                policy_sum += prior
 
-            for mv, p in zip(moves_kept, priors):
-                child_board = board.copy(stack=False)
-                child_board.push(mv)
-                node.children[mv] = MCTSNode(child_board, parent=node, prior=float(p))
+        # Renormalize
+        if policy_sum > 0:
+            for child in node.children.values():
+                child.prior /= policy_sum
+        else:
+            for child in node.children.values():
+                child.prior = 1.0 / len(legal_moves)
 
-        # safety fallback – ако по някаква причина всичко е skip-нато
-        if not node.children:
-            uniform_p = 1.0 / len(legal)
-            for mv in legal:
-                child_board = board.copy(stack=False)
-                child_board.push(mv)
-                node.children[mv] = MCTSNode(child_board, parent=node, prior=uniform_p)
-
-        return value
+        return leaf_value
 
     # =====================================================
-    # Dirichlet Noise at Root
+    # Helpers
     # =====================================================
     def _apply_dirichlet_noise(self, root, move_number):
-        """
-        Добавяме Dirichlet noise към prior-ите на root децата.
-        Ползваме го основно в opening (примерно до 30-ти полуход).
-        """
-        if not root.children:
-            return
-
-        if move_number is not None and move_number > 30:
-            return
+        if not root.children: return
+        if move_number is not None and move_number > 30: return
 
         eps = self.dirichlet_epsilon
         moves = list(root.children.keys())
@@ -213,21 +173,8 @@ class MCTS:
             child = root.children[mv]
             child.prior = (1.0 - eps) * child.prior + eps * float(n)
 
-        # FIX (по желание, но е добре): ренормализация след noise
-        s = sum(ch.prior for ch in root.children.values())
-        if s > 1e-12:
-            for ch in root.children.values():
-                ch.prior /= s
-
-    # =====================================================
-    # Selection (PUCT)
-    # =====================================================
     def _select_child(self, node):
-        """
-        Избираме дете по стандартната PUCT формула:
-        score = Q + U, където U ~ prior * sqrt(N) / (1 + n)
-        """
-        best_score = -1e9
+        best_score = -float('inf')
         best_move = None
         best_child = None
 
@@ -235,9 +182,11 @@ class MCTS:
         sqrt_parent = math.sqrt(parent_visits)
 
         for mv, child in node.children.items():
-            q = child.q_value
+            # FIX: Използваме -q, защото child.q_value е добър за опонента
+            q = -child.q_value
             u = self.c_puct * child.prior * (sqrt_parent / (1 + child.visit_count))
             score = q + u
+
             if score > best_score:
                 best_score = score
                 best_move = mv
@@ -245,27 +194,14 @@ class MCTS:
 
         return best_move, best_child
 
-    # =====================================================
-    # Backup
-    # =====================================================
     def _backup(self, path, value):
-        """
-        Backprop на value по пътя root → leaf, като flip-ваме знака,
-        защото value е винаги от гледна точка на играча на ход.
-        """
         v = value
         for node in reversed(path):
             node.value_sum += v
             node.visit_count += 1
-            v = -v  # flip perspective при смяна на ход
+            v = -v
 
-    # =====================================================
-    # Final Policy at Root
-    # =====================================================
     def _compute_root_policy(self, root):
-        """
-        Връща π като {move: prob} на база visit counts от root-а.
-        """
         moves = list(root.children.keys())
         visits = np.array([root.children[mv].visit_count for mv in moves], dtype=np.float32)
 
@@ -276,18 +212,9 @@ class MCTS:
 
         return {mv: float(p) for mv, p in zip(moves, probs)}
 
-    # =====================================================
-    # Debug: π + Q-values at root
-    # =====================================================
     def run_with_Q(self, board, move_number=None):
-        """
-        Връща:
-          pi: {move: prob} по visit-counts
-          Q : {move: q_value} средна стойност на детето
-        """
         pi = self.run(board, move_number)
-
-        root = self.last_root  # FIX: реалния root от последния run
+        root = self.last_root
         Q = {}
         if root is not None and root.children:
             for move, child in root.children.items():
@@ -295,5 +222,4 @@ class MCTS:
         else:
             for move in pi.keys():
                 Q[move] = 0.0
-
         return pi, Q

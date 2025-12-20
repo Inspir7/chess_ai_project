@@ -1,130 +1,151 @@
+import sys
+import os
+import random
 import chess
 import torch
-import random
+import numpy as np
+
+# ==========================
+# SETUP PATHS
+# ==========================
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from models.AlphaZero import AlphaZeroModel
-from utils.mcts_move_selector import mcts_select_move
+from training.mcts import MCTS
 
-
+# ==========================
+# CONFIG
+# ==========================
+# Използваме релативен път, за да е по-сигурно
+MODEL_PATH = os.path.join(PROJECT_ROOT, "training/rl/checkpoints/alpha_zero_rl_checkpoint_final.pth")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#MODEL_PATH = "/home/presi/projects/chess_ai_project/training/rl/checkpoints/alpha_zero_rl_main.pth"
-MODEL_PATH = "/home/presi/projects/chess_ai_project/training/rl/checkpoints/alpha_zero_rl_checkpoint_ep130.pth"
 
 
+def get_ai_move(model, board, simulations=800):
+    """
+    Връща най-добрия ход според AlphaZero.
+    ВАЖНО: Тук изключваме шума и случайността!
+    """
+    # 1. Създаваме MCTS с epsilon=0.0 (БЕЗ ШУМ!)
+    mcts = MCTS(
+        model,
+        DEVICE,
+        simulations=simulations,
+        dirichlet_epsilon=0.0,  # <-- ИЗКЛЮЧВАМЕ ШУМА
+        c_puct=1.5  # Стандартно за игра
+    )
 
-# ------------------------------------------------------
-# EASY BOT 1: RANDOM MOVE BOT
-# ------------------------------------------------------
-def random_bot(board: chess.Board):
-    """Връща напълно случаен легален ход."""
-    return random.choice(list(board.legal_moves))
+    # 2. Пускаме MCTS
+    # move_number=100 лъже MCTS, че не сме в дебюта
+    pi = mcts.run(board, move_number=100)
 
+    # 3. GREEDY SELECTION (Най-висока вероятност)
+    moves = list(pi.keys())
+    probs = list(pi.values())
 
-# ------------------------------------------------------
-# EASY BOT 2: MATERIAL BOT (избира най-добрата размяна)
-# ------------------------------------------------------
-PIECE_VALUES = {
-    chess.PAWN: 1,
-    chess.KNIGHT: 3,
-    chess.BISHOP: 3,
-    chess.ROOK: 5,
-    chess.QUEEN: 9,
-}
+    if not moves:
+        return None
 
-
-def material_bot(board: chess.Board):
-    """Избира хода, който води до най-добра моментална материална печалба."""
-    best_move = None
-    best_score = -999
-
-    for move in board.legal_moves:
-        score = 0
-        if board.is_capture(move):
-            piece = board.piece_at(move.to_square)
-            if piece:
-                score += PIECE_VALUES.get(piece.piece_type, 0)
-
-        if score > best_score:
-            best_score = score
-            best_move = move
-
-    # ако няма печелившо вземане → просто избери случаен ход
-    if best_move is None:
-        best_move = random.choice(list(board.legal_moves))
+    best_idx = np.argmax(probs)
+    best_move = moves[best_idx]
 
     return best_move
 
 
-# ------------------------------------------------------
-# ИГРА НА МАЧОВЕ
-# ------------------------------------------------------
-def play_match(model, opponent_func, games=20, simulations=100):
-    score = 0.0
-
-    for g in range(1, games + 1):
-        board = chess.Board()
-        is_white = (g % 2 == 1)
-
-        while not board.is_game_over():
-
-            if board.turn == chess.WHITE:
-                if is_white:
-                    # AlphaZero plays white
-                    move = mcts_select_move(model, board, DEVICE, simulations)
-                else:
-                    move = opponent_func(board)
-            else:
-                if not is_white:
-                    # AlphaZero plays black
-                    move = mcts_select_move(model, board, DEVICE, simulations)
-                else:
-                    move = opponent_func(board)
-
-            board.push(move)
-
-        result = board.result()
-
-        if (result == "1-0" and is_white) or (result == "0-1" and not is_white):
-            score += 1
-        elif result == "1/2-1/2":
-            score += 0.5
-
-        print(f"Game {g}/{games}: result={result}")
-
-    return score / games
+def get_random_move(board):
+    return random.choice(list(board.legal_moves))
 
 
-# ------------------------------------------------------
-# MAIN
-# ------------------------------------------------------
-def main():
-    print("==============================")
-    print(" AlphaZero vs EASY BOTS")
-    print("==============================")
+def print_board(board):
+    print("--------------------------------------------------")
+    print(board)
+    print("--------------------------------------------------")
 
-    print("[INFO] Loading model...")
-    model = AlphaZeroModel()
-    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-    model.load_state_dict(state_dict)
-    model.to(DEVICE)
-    model.eval()
 
-    # -------------------------------
-    # Test vs Random Bot
-    # -------------------------------
-    print("\n=== Testing vs RANDOM BOT ===")
-    score_random = play_match(model, random_bot, games=20, simulations=80)
-    print(f"→ Avg score vs random bot = {score_random:.3f}")
+def play_debug_game(model, ai_color):
+    board = chess.Board()
+    ai_color_str = "White" if ai_color == chess.WHITE else "Black"
 
-    # -------------------------------
-    # Test vs Material Bot
-    # -------------------------------
-    print("\n=== Testing vs MATERIAL BOT ===")
-    score_material = play_match(model, material_bot, games=20, simulations=80)
-    print(f"→ Avg score vs material bot = {score_material:.3f}")
+    print(f"\n=== Game (AI is {ai_color_str}) vs RANDOM BOT ===")
 
-    print("\nDone.\n")
+    moves_count = 0
+    # УВЕЛИЧАВАМЕ симулациите на 800 - дай му време да мисли!
+    AI_SIMS = 800
+
+    while not board.is_game_over() and moves_count < 150:
+        # --- MERCY RULE (Милост) ---
+        # Ако AI води с много материал, признаваме победата веднага
+        piece_vals = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+        w_mat = sum(len(board.pieces(pt, chess.WHITE)) * val for pt, val in piece_vals.items())
+        b_mat = sum(len(board.pieces(pt, chess.BLACK)) * val for pt, val in piece_vals.items())
+
+        if ai_color == chess.WHITE:
+            diff = w_mat - b_mat
+        else:
+            diff = b_mat - w_mat
+
+        if diff >= 10:  # Ако води с 10 точки (Дама + пешка)
+            print(f"✅ MERCY RULE: AI води с {diff} точки! Присъждаме победа.")
+            break
+        # ---------------------------
+
+        if board.turn == ai_color:
+            try:
+                move = get_ai_move(model, board, simulations=AI_SIMS)
+                if move is None or move not in board.legal_moves:
+                    print(f"❌ AI TRIED ILLEGAL MOVE: {move}")
+                    break
+            except Exception as e:
+                print(f"❌ AI CRASHED: {e}")
+                break
+        else:
+            move = get_random_move(board)
+
+        board.push(move)
+        moves_count += 1
+
+        if moves_count % 10 == 0:
+            print(f"Move {moves_count} | Material Diff: {diff}")
+
+    print(f"--- FINAL BOARD (Move {moves_count}) ---")
+    print_board(board)
+    print(f"Result: {board.result()}")
+
+    # Финална проверка на материала
+    piece_vals = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+    w_mat = sum(len(board.pieces(pt, chess.WHITE)) * val for pt, val in piece_vals.items())
+    b_mat = sum(len(board.pieces(pt, chess.BLACK)) * val for pt, val in piece_vals.items())
+
+    final_diff = w_mat - b_mat if ai_color == chess.WHITE else b_mat - w_mat
+
+    print(f"AI Material Advantage: {final_diff} points")
+
+    if final_diff > 3:
+        print(f"✅ РЕЗУЛТАТ: AI печели по материал (+{final_diff})!")
+    elif final_diff < -3:
+        print(f"❌ РЕЗУЛТАТ: AI загуби материал ({final_diff}).")
+    else:
+        print(f"⚠️ РЕЗУЛТАТ: Равностойно ({final_diff}).")
 
 
 if __name__ == "__main__":
-    main()
+    print(f"Loading RL Model: {MODEL_PATH}")
+    if not os.path.exists(MODEL_PATH):
+        print("❌ MODEL NOT FOUND!")
+        # Опит с абсолютен път, ако горното не работи
+        ALT_PATH = "/home/presi/projects/chess_ai_project/training/rl/checkpoints/alpha_zero_rl_checkpoint_final.pth"
+        if os.path.exists(ALT_PATH):
+            print(f"Found at absolute path: {ALT_PATH}")
+            MODEL_PATH = ALT_PATH
+        else:
+            exit()
+
+    model = AlphaZeroModel().to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    model.eval()
+
+    # Играем 2 игри
+    play_debug_game(model, chess.WHITE)
+    play_debug_game(model, chess.BLACK)

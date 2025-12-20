@@ -45,7 +45,7 @@ def flip_value(v: torch.Tensor):
 
 
 # ===================================================================
-#  STREAMING DATASET (RAM-freiendly)
+#  STREAMING DATASET (RAM-friendly)
 # ===================================================================
 class ShardedIterableDataset(IterableDataset):
     def __init__(self, folder, prefix, augment=False):
@@ -53,6 +53,7 @@ class ShardedIterableDataset(IterableDataset):
         self.prefix = prefix
         self.augment = augment
 
+        # Търсим файлове, които започват с "train_states_" или "val_states_"
         self.state_files = sorted(
             f for f in os.listdir(folder)
             if f.startswith(f"{prefix}_states_") and f.endswith(".npy")
@@ -66,23 +67,28 @@ class ShardedIterableDataset(IterableDataset):
             if f.startswith(f"{prefix}_values_") and f.endswith(".npy")
         )
 
+        assert len(self.state_files) > 0, f"No files found in {folder} with prefix '{prefix}'!"
         assert len(self.state_files) == len(self.policy_files) == len(self.value_files)
+
         self.num_shards = len(self.state_files)
-        print(f"[STREAM] Dataset {prefix}: {self.num_shards} shards found.")
+        print(f"[STREAM] Dataset '{prefix}' in '{folder}': {self.num_shards} shards found.")
 
     def __iter__(self):
         for i in range(self.num_shards):
-
             s_path = os.path.join(self.folder, self.state_files[i])
             p_path = os.path.join(self.folder, self.policy_files[i])
             v_path = os.path.join(self.folder, self.value_files[i])
 
-            states  = np.load(s_path, mmap_mode="r")
-            policies = np.load(p_path, mmap_mode="r")
-            values  = np.load(v_path, mmap_mode="r")
+            try:
+                states = np.load(s_path, mmap_mode="r")
+                policies = np.load(p_path, mmap_mode="r")
+                values = np.load(v_path, mmap_mode="r")
+            except Exception as e:
+                print(f"Skipping corrupted file {s_path}: {e}")
+                continue
 
             for j in range(states.shape[0]):
-                # NHWC → CHW
+                # NHWC -> CHW
                 s = torch.tensor(
                     states[j].transpose(2, 0, 1),
                     dtype=torch.float32
@@ -108,48 +114,55 @@ class ShardedIterableDataset(IterableDataset):
 # ===================================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default="/home/presi/projects/chess_ai_project/data")
-    parser.add_argument("--save", default="/home/presi/projects/chess_ai_project/training/alpha_zero_supervised.pth")
+    # Стандартната директория е project_root/data/processed
+    default_data_dir = os.path.join(PROJECT_ROOT, "data", "processed")
+
+    parser.add_argument("--data_dir", default=default_data_dir)
+    parser.add_argument("--save", default=os.path.join(PROJECT_ROOT,
+                                                       "training/rl/checkpoints/alpha_zero_supervised.pth"))
+    # ^ Промених save path-а да съвпада с този, който ползваш за игра!
+
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch",  type=int, default=256)
-    parser.add_argument("--lr",     type=float, default=1e-3)
+    parser.add_argument("--batch", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     writer = SummaryWriter(log_dir="logs/supervised_streaming")
 
-    # Training uses augmentation; validation does NOT
-    train_ds = ShardedIterableDataset(args.data_dir, "train_labeled", augment=True)
-    val_ds   = ShardedIterableDataset(args.data_dir, "val_labeled", augment=False)
+    # --- ТУК Е ГОЛЯМАТА ПРОМЯНА ---
+    # Сочим към правилните подпапки и ползваме правилния префикс ("train", не "train_labeled")
+    train_dir = os.path.join(args.data_dir, "train")
+    val_dir = os.path.join(args.data_dir, "val")
+
+    print(f"Loading Training Data from: {train_dir}")
+    train_ds = ShardedIterableDataset(train_dir, "train", augment=True)
+
+    print(f"Loading Validation Data from: {val_dir}")
+    val_ds = ShardedIterableDataset(val_dir, "val", augment=False)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch)
+    val_loader = DataLoader(val_ds, batch_size=args.batch)
 
     model = AlphaZeroModel().to(device)
 
     opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    # ---------------------------------------------------
-    # Learning Rate Scheduler: Cosine decay + warmup
-    # ---------------------------------------------------
+    # Scheduler: Cosine decay
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.epochs, eta_min=1e-5
     )
 
-    CE  = nn.CrossEntropyLoss()
+    CE = nn.CrossEntropyLoss()
     MSE = nn.MSELoss()
 
-    best = float("inf")
+    best_loss = float("inf")
 
     print("\n========================================")
-    print("     TRAINING STARTED (streaming mode)")
+    print("      TRAINING STARTED (Supervised)")
     print("========================================\n")
 
-    # ---------------------------------------------------
-    # MAIN TRAIN LOOP
-    # ---------------------------------------------------
     for ep in range(1, args.epochs + 1):
-
         # ---------------- TRAIN ----------------
         model.train()
         t_loss = t_acc = batches = 0
@@ -169,13 +182,18 @@ def main():
             opt.step()
 
             t_loss += loss.item()
-            t_acc  += (logits.argmax(1) == pi_idx).float().mean().item()
+            t_acc += (logits.argmax(1) == pi_idx).float().mean().item()
             batches += 1
 
-        t_loss /= batches
-        t_acc  /= batches
+            # Print progress every 100 batches to know it's alive
+            if batches % 100 == 0:
+                print(f"  Ep {ep} | Batch {batches} | Loss {loss.item():.4f}", end="\r")
 
-        # Step scheduler AFTER epoch
+        if batches > 0:
+            t_loss /= batches
+            t_acc /= batches
+
+        # Step scheduler
         scheduler.step()
 
         # ---------------- VAL ----------------
@@ -194,26 +212,30 @@ def main():
                 loss = loss_p + loss_v
 
                 v_loss += loss.item()
-                v_acc  += (logits.argmax(1) == pi_idx).float().mean().item()
+                v_acc += (logits.argmax(1) == pi_idx).float().mean().item()
                 v_batches += 1
 
-        v_loss /= v_batches
-        v_acc  /= v_batches
+        if v_batches > 0:
+            v_loss /= v_batches
+            v_acc /= v_batches
 
-        print(f"[Epoch {ep}] "
+        print(f"\n[Epoch {ep}] "
               f"Train loss={t_loss:.4f} acc={t_acc:.4f} | "
               f"Val loss={v_loss:.4f} acc={v_acc:.4f} | "
               f"LR={scheduler.get_last_lr()[0]:.6f}")
 
         writer.add_scalar("train/loss", t_loss, ep)
-        writer.add_scalar("train/acc",  t_acc, ep)
-        writer.add_scalar("val/loss",   v_loss, ep)
-        writer.add_scalar("val/acc",    v_acc, ep)
+        writer.add_scalar("train/acc", t_acc, ep)
+        writer.add_scalar("val/loss", v_loss, ep)
+        writer.add_scalar("val/acc", v_acc, ep)
 
-        if v_loss < best:
-            best = v_loss
+        # Save checkpoint if improved
+        if v_loss < best_loss:
+            best_loss = v_loss
+            # Увери се, че папката съществува преди запис
+            os.makedirs(os.path.dirname(args.save), exist_ok=True)
             torch.save(model.state_dict(), args.save)
-            print(f"   ✓ Saved best checkpoint → {args.save}")
+            print(f"   ✓ New best model saved to {args.save}")
 
     writer.close()
 
