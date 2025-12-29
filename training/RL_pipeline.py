@@ -158,14 +158,24 @@ class RLPipeline:
             supervised_path: str = SUPERVISED_INIT_PATH,
             rl_model_path: str = RL_MODEL_PATH,
             optimizer_path: str = RL_OPT_PATH,
-            lr: float = 1e-4,
+            lr: float = 0.000035,
             weight_decay: float = 1e-4,
             buffer_capacity: int = 1_200_000,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = AlphaZeroModel().to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        #self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        # VREMENNO Хардкодваме стойността, за да игнорираме всичко друго
+        #self.optimizer = optim.Adam(self.model.parameters(), lr=0.000035, weight_decay=weight_decay)
+        # Фина настройка за Фаза 2 (Bootcamp)
+        # Намаляваме от 0.000035 на 0.00002
+        #self.optimizer = optim.Adam(self.model.parameters(), lr=0.00002, weight_decay=weight_decay)
+
+        # === ФАЗА VI: ANNEALING / STABILIZATION ===
+        # Много нисък LR за фино полиране
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0000005, weight_decay=weight_decay)
 
         # LR scheduler ще се създаде в run_training,
         # защото там знаем episodes * train_steps (T_max за cosine).
@@ -451,14 +461,16 @@ class RLPipeline:
                     progress = 1.0
 
                 # Температура за този епизод
-                current_temp = temp_start + (temp_final - temp_start) * progress
+                current_temp = temperature
+                # = temp_start + (temp_final - temp_start) * progress -> izkluchvane na scheduler
 
                 # Никога да не пада под разумен минимум (предпазва от реми-колапс)
                 # current_temp = max(current_temp, 1.05) - early state
-                current_temp = max(current_temp, 0.8)  # mid-state
+                #current_temp = max(current_temp, 0.8)  # mid-state -> deleted for last phase
 
                 # Sims за този епизод (нарастват с епизода)
-                current_sims = int(sims_start + (sims_end - sims_start) * progress)
+                #current_sims = int(sims_start + (sims_end - sims_start) * progress) -> deleted for annealing phase
+                current_sims = sims
 
                 self.log(
                     f"\n[EP {ep}] Collecting self-play... "

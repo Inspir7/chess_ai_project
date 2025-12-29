@@ -143,10 +143,17 @@ def play_episode(
     # (Това изисква да си взел ВСИЧКО, за да ти даде служебна победа)
 
     # НОВО:
-    MERCY_THRESHOLD = 0.85
+    #MERCY_THRESHOLD = 0.85
     # (Това е равно на предимство от Топ или повече.
     # Ако AI поведе с Топ, спираме играта и му казваме "ТИ ПОБЕДИ".
     # Така то ще се научи, че материалното предимство води директно до победа.)
+
+    # СТАРО: MERCY_THRESHOLD = 0.85
+
+    # НОВО: Фаза 2 - Killer Instinct
+    # Слагаме го на 0.99. Това означава, че играта спира само ако имаме Дама + Топове повече.
+    # За всичко по-малко (примерно само един Топ повече) - ТРЯБВА ДА МАТИРА!
+    MERCY_THRESHOLD = 0.99
 
     # ================= GAME LOOP =================
     while not board.is_game_over() and ply < max_steps:
@@ -229,17 +236,33 @@ def play_episode(
         board.push(move)
         ply += 1
 
-    # ================= END OF GAME =================
-    if board.is_game_over():
-        r = board.result()
-        if r == "1-0":
-            final_z = 1.0
-        elif r == "0-1":
-            final_z = -1.0
-        else:
-            # При реми все пак гледаме материала
-            mat_score = static_material_eval(board)
-            final_z = mat_score * 0.5
+        # ================= END OF GAME =================
+        if board.is_game_over():
+            r = board.result()
+            if r == "1-0":
+                final_z = 1.0
+            elif r == "0-1":
+                final_z = -1.0
+            else:
+                '''При реми все пак гледаме материала
+                #mat_score = static_material_eval(board)
+                #final_z = mat_score * 0.5'''
+
+                # === ТУК Е МАГИЯТА ЗА ФАЗА 2 ===
+                # Реми (Stalemate, 3-fold repetition, 50-move rule)
+                mat_score = static_material_eval(board)  # Връща позитивнo за белите, негативно за черните
+
+                # Логика: "Ако имаш материално предимство, но направиш реми -> ГУБИШ ТОЧКИ"
+                # 0.4 съответства на около 2 пешки предимство.
+
+                if abs(mat_score) > 0.4:
+                    # Наказваме страната, която има материал, но не е успяла да бие
+                    # Вместо 0.0, даваме -0.5 (половин загуба)
+                    final_z = -0.8 * np.sign(mat_score)
+                else:
+                    # Ако материалът е равен, ремито е честно (0.0)
+                    final_z = 0.0
+
     else:
         # Timeout (Truncated) - не е стигнал threshold-а, но времето свърши
         # Оценяваме позицията по материал
