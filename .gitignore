@@ -12,7 +12,9 @@ training/epoch
 data/invalid_games.txt
 gui/utils/replays/replay_buffer.pkl
 sos.txt
-#config.py
+#paths.py
+
+.idea/
 
 # ======================
 # Training artifacts
