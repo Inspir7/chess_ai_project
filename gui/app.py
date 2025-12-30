@@ -5,7 +5,6 @@ import random
 import math
 
 from PySide6.QtGui import QColor, QFont, QPainter, QRadialGradient, QPixmap, QImage, QPen, QIcon
-
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -18,7 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QRect, QTimer
 
 from gui.board_widget import ChessBoardWidget, PieceRenderMode
 from gui.game_controller import GameController
@@ -122,7 +121,29 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Chess AI")
         self.setMinimumSize(1100, 650)
 
-        self.setWindowIcon(QIcon("assets/barbie/icon.png"))
+        # --- УМНО ЗАРЕЖДАНЕ НА ИКОНА (Code Fix) ---
+        try:
+            base_pixmap = QPixmap("assets/barbie/icon-logo.png")
+            if not base_pixmap.isNull():
+                square_size = 64
+                square_pixmap = QPixmap(square_size, square_size)
+                square_pixmap.fill(Qt.transparent)
+
+                painter = QPainter(square_pixmap)
+                painter.setRenderHint(QPainter.Antialiasing)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+                scaled_logo = base_pixmap.scaled(square_size, square_size, Qt.KeepAspectRatio,
+                                                 Qt.SmoothTransformation)
+                x = (square_size - scaled_logo.width()) // 2
+                y = (square_size - scaled_logo.height()) // 2
+
+                painter.drawPixmap(x, y, scaled_logo)
+                painter.end()
+
+                self.setWindowIcon(QIcon(square_pixmap))
+        except Exception as e:
+            print(f"Could not load icon: {e}")
 
         self.analysis_controller = AnalysisController()
         ai_engine = ChessAI()
@@ -130,29 +151,97 @@ class MainWindow(QMainWindow):
         self.controller = GameController(mcts_engine=ai_engine, analysis_controller=self.analysis_controller)
         self.controller.set_mode(GameMode.HUMAN_VS_HUMAN)
 
+        # Свързваме сигнала за автоматично опресняване
+        self.controller.board_changed.connect(self.update_ui)
+
+        # Свързване на сигнала за промяна на имената на играчите
+        if hasattr(self.controller, "players_changed"):
+            self.controller.players_changed.connect(self.update_player_labels)
+
         central = QWidget()
         main_layout = QHBoxLayout(central)
 
+        # --- КОНТЕЙНЕР ЗА ДЪСКАТА И ЕТИКЕТИТЕ ---
+        central = QWidget()
+        main_layout = QHBoxLayout(central)
+
+        # Създаваме вертикален лейаут за дъската и имената под нея
+        board_container_layout = QVBoxLayout()
+
         self.board = ChessBoardWidget(self.controller, self.analysis_controller)
-        main_layout.addWidget(self.board, stretch=3)
+        # stretch=1 тук казва на дъската да се разпъва максимално вертикално
+        board_container_layout.addWidget(self.board, stretch=1)
 
+        # Етикети за играчите
+        self.player_white_lbl = QLabel("White: Human")
+        self.player_black_lbl = QLabel("Black: Human")
+        label_style = "font-weight: bold; color: #9E4F68; font-size: 13px; margin: 5px;"
+        self.player_white_lbl.setStyleSheet(label_style)
+        self.player_black_lbl.setStyleSheet(label_style)
+
+        players_info_layout = QHBoxLayout()
+        players_info_layout.addWidget(self.player_white_lbl)
+        players_info_layout.addStretch()
+        players_info_layout.addWidget(self.player_black_lbl)
+
+        board_container_layout.addLayout(players_info_layout)
+
+        # Добавяме контейнера на дъската в основния лейаут
+        # stretch=1 тук позволява на дъската да заеме цялото ляво пространство
+        main_layout.addLayout(board_container_layout, stretch=1)
+
+        # --- ДЕСЕН ПАНЕЛ (Контроли и Анализ) ---
         right_panel = QVBoxLayout()
-
         controls = self._create_controls_panel()
         right_panel.addWidget(controls)
 
         self.analysis_widget = TopMovesWidget(self.analysis_controller)
         right_panel.addWidget(self.analysis_widget)
-
         right_panel.addStretch(1)
 
         right_container = QWidget()
         right_container.setLayout(right_panel)
-        right_container.setFixedWidth(260)
+        # ФИКСИРАМЕ ширината, за да не "яде" от мястото на дъската
+        right_container.setFixedWidth(280)
 
         main_layout.addWidget(right_container)
 
         self.setCentralWidget(central)
+
+        self.ai_thinking = False  # Флаг за предотвратяване на натрупване на таймери
+
+        # Първоначално задаване на имената
+        self.update_player_labels()
+
+    def update_player_labels(self):
+        """Обновява текста на етикетите според избрания режим и опонент."""
+        white = self.controller.white_player
+        black = self.controller.black_player
+
+        def get_name(p):
+            if isinstance(p, str):  # За ботовете от Benchmark режима (random, material, stockfish)
+                return p.capitalize() + " Bot"
+            if hasattr(p, "is_ai") and p.is_ai():
+                return "Presie AI"
+            return "Human"
+
+        self.player_white_lbl.setText(f"White: {get_name(white)}")
+        self.player_black_lbl.setText(f"Black: {get_name(black)}")
+
+    def update_ui(self):
+        """Предизвиква прерисуване на дъската и планира следващия AI ход."""
+        self.board.update()
+
+        # Проверяваме дали е ред на AI и дали вече не изчакваме ход, за да не се забързва
+        if self.controller.is_ai_turn() and not self.ai_thinking:
+            self.ai_thinking = True
+            delay = max(10, self.controller.ai_delay)
+            QTimer.singleShot(delay, self.run_ai_step)
+
+    def run_ai_step(self):
+        """Изпълнява AI хода и освобождава флага за следващия."""
+        self.ai_thinking = False
+        self.controller.play_ai_move()
 
     def _create_controls_panel(self) -> QWidget:
         panel = QGroupBox("Controls")
@@ -164,24 +253,23 @@ class MainWindow(QMainWindow):
         btn_new_game = QPushButton("New Game")
         btn_new_game.setCursor(Qt.PointingHandCursor)
 
-        # Стил на бутона
         btn_new_game.setStyleSheet("""
             QPushButton {
-                background-color: #FFE0E9; /* Светло розово (Pink) */
-                color: #9E4F68;           /* Тъмно розово за текста */
-                border: 1px solid #F3C1D0; /* Hot Pink рамка */
-                border-radius: 15px;      /* Силно заоблени ъгли */
+                background-color: #FFE0E9;
+                color: #9E4F68;
+                border: 1px solid #F3C1D0;
+                border-radius: 15px;
                 padding: 8px;
                 font-weight: bold;
                 font-family: sans-serif;
             }
             QPushButton:hover {
-                background-color: #FFB7C5; /* Hot Pink при минаване */
-                color: #6D2E40;            /* Малко по-тъмен текст за контраст */
+                background-color: #FFB7C5;
+                color: #6D2E40;
                 border: 1px solid #E89CAD;
             }
             QPushButton:pressed {
-                background-color: #E69AB0; /* При натискане - една идея по-плътно */
+                background-color: #E69AB0;
                 color: white;
             }
         """)
@@ -213,6 +301,44 @@ class MainWindow(QMainWindow):
         layout.addWidget(mode_group)
         layout.addSpacing(10)
 
+        # --- BENCHMARK MODE (AI vs Bots) ---
+        bench_group = QGroupBox("Benchmark (AI vs Bots)")
+        vbox_bench = QVBoxLayout()
+
+        bench_style = """
+            QPushButton {
+                background-color: #F8F0F5;
+                border: 1px solid #D8BFD8;
+                border-radius: 10px;
+                padding: 6px;
+                color: #555;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #FFE4E1; }
+        """
+
+        btn_easy = QPushButton("vs Random Bot")
+        btn_easy.setStyleSheet(bench_style)
+        btn_easy.setCursor(Qt.PointingHandCursor)
+        btn_easy.clicked.connect(lambda: self.controller.set_benchmark_mode("random"))
+        vbox_bench.addWidget(btn_easy)
+
+        btn_med = QPushButton("vs Material Bot")
+        btn_med.setStyleSheet(bench_style)
+        btn_med.setCursor(Qt.PointingHandCursor)
+        btn_med.clicked.connect(lambda: self.controller.set_benchmark_mode("material"))
+        vbox_bench.addWidget(btn_med)
+
+        btn_sf = QPushButton("vs Stockfish")
+        btn_sf.setStyleSheet(bench_style)
+        btn_sf.setCursor(Qt.PointingHandCursor)
+        btn_sf.clicked.connect(lambda: self.controller.set_benchmark_mode("stockfish"))
+        vbox_bench.addWidget(btn_sf)
+
+        bench_group.setLayout(vbox_bench)
+        layout.addWidget(bench_group)
+        layout.addSpacing(10)
+
         # --- AI Speed Control ---
         speed_group = QGroupBox("AI Speed")
         vbox_speed = QVBoxLayout()
@@ -222,7 +348,7 @@ class MainWindow(QMainWindow):
         self.lbl_speed.setStyleSheet("color: #666; font-size: 11px;")
 
         self.slider_speed = QSlider(Qt.Horizontal)
-        self.slider_speed.setRange(0, 2000)
+        self.slider_speed.setRange(10, 2000)
         self.slider_speed.setValue(50)
         self.slider_speed.valueChanged.connect(self._on_speed_changed)
 
@@ -275,7 +401,6 @@ def main():
     window = MainWindow()
 
     window.show()
-    # Фокусираме прозореца (за проблема с PyCharm)
     window.activateWindow()
     window.raise_()
 

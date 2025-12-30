@@ -123,13 +123,6 @@ class ChessBoardWidget(QWidget):
         """Извиква се от контролера, когато някой (човек или AI) направи ход."""
         self.update()  # Веднага обновяваме екрана
 
-        # Проверяваме дали е ред на AI
-        if self.controller.is_ai_turn():
-            # ПРОМЯНА: Ползваме динамичното забавяне от слайдера
-            delay = self.controller.ai_delay
-            # Извикваме AI (минимум 1ms)
-            QTimer.singleShot(max(1, delay), self.controller.play_ai_move)
-
     def _on_highlight_move(self, move):
         """Вика се, когато минем с мишката върху ход в списъка."""
         self.current_hover_move = move
@@ -641,7 +634,9 @@ class ChessBoardWidget(QWidget):
         return PROMOTION_PIECES[idx] if idx is not None else None
 
     def _maybe_play_ai(self):
-        pass
+        if self.controller.is_ai_turn() and not self.controller.board.is_game_over():
+            # Използваме таймера, който вече имаш, за да се спази ai_delay
+            QTimer.singleShot(self.controller.ai_delay, self.controller.play_ai_move)
 
     def _square_from_pos(self, pos):
         size = min(self.width(), self.height())
