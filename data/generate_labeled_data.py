@@ -56,7 +56,7 @@ def fen_to_tensor(input_data):
     """
     Приема chess.Board или FEN.
     Връща (8,8,15) тензор.
-    АВТОМАТИЧНО ЗАВЪРТА ДЪСКАТА (Fix за RL "Suicide" bug).
+    FIX: Завърта дъската И разменя цветовете на каналите!
     """
     # 1. Input Check
     if isinstance(input_data, str):
@@ -64,24 +64,38 @@ def fen_to_tensor(input_data):
     else:
         board = input_data
 
-    # 2. PERSPECTIVE FLIP (Липсваше в твоя код!)
-    # Ако е ред на черните, обръщаме дъската, за да изглежда като за бели
-    if board.turn == chess.BLACK:
-        board = board.transform(chess.flip_vertical)
-        board = board.transform(chess.flip_horizontal)
-
-    # Mapping
+    # 2. Дефинираме мапинга ПО ПОДРАЗБИРАНЕ (за Бели)
+    # P=0..5 (My pieces), p=6..11 (Enemy pieces)
     piece_map = {
         'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
         'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
     }
+
+    # 3. PERSPECTIVE FLIP & COLOR SWAP (Това липсваше!)
+    if board.turn == chess.BLACK:
+        # А) Завъртаме дъската геометрично
+        board = board.transform(chess.flip_vertical)
+        board = board.transform(chess.flip_horizontal)
+
+        # Б) РАЗМЕНЯМЕ КАНАЛИТЕ! (Критичната поправка)
+        # Сега черните фигури ('p') стават "Наши" (0..5)
+        # А белите фигури ('P') стават "Вражески" (6..11)
+        piece_map = {
+            'p': 0, 'n': 1, 'b': 2, 'r': 3, 'q': 4, 'k': 5,
+            'P': 6, 'N': 7, 'B': 8, 'R': 9, 'Q': 10, 'K': 11
+        }
+
+    # 4. Пълнене на тензора
     tensor = np.zeros((8, 8, 15), dtype=np.float32)
 
     for square, piece in board.piece_map().items():
         x, y = divmod(square, 8)
-        tensor[7 - x, y, piece_map[piece.symbol()]] = 1.0
+        # Използваме динамичния piece_map
+        channel = piece_map[piece.symbol()]
+        tensor[7 - x, y, channel] = 1.0
 
-    tensor[:, :, 12] = 1.0
+    # 5. Global features
+    tensor[:, :, 12] = 1.0  # Винаги 1, защото гледаме от наша гледна точка
     tensor[:, :, 13] = board.fullmove_number / 100.0
     tensor[:, :, 14] = determine_phase(board)
 
