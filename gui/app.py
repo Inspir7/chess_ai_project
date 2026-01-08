@@ -29,7 +29,8 @@ from gui.panels import TopMovesWidget
 from training.mcts import MCTS
 from training.move_encoding import get_total_move_count
 
-
+from models.AlphaZero import AlphaZeroModel
+'''
 # =========================================================
 # DUMMY MODEL (За да тръгне играта веднага)
 # =========================================================
@@ -43,73 +44,116 @@ class DummyChessModel(nn.Module):
         policy_logits = torch.randn(batch_size, self.output_size)
         value = torch.tanh(torch.randn(batch_size, 1))
         return policy_logits, value
-
+'''
 
 # =========================================================
-# AI WRAPPER (Адаптер)
+# AI WRAPPER
 # =========================================================
 class ChessAI:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"AI using device: {self.device}")
 
-        # Засега ползваме Dummy
-        self.model = DummyChessModel().to(self.device)
-        self.model.eval()
+        import os
 
-        self.mcts = MCTS(self.model, self.device, simulations=80)
+        # Вътре в ChessAI.__init__
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        model_path = os.path.join(base_dir, "models", "alpha_zero_rl_checkpoint_final.pth")
+
+        try:
+            self.model = AlphaZeroModel().to(self.device)
+            checkpoint = torch.load(model_path, map_location=self.device)
+
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                self.model.load_state_dict(checkpoint)
+
+            self.model.eval()
+            print("Successfully loaded the Presie AlphaZero model!")
+        except Exception as e:
+            print(f"Error while loading model: {e}")
+            # Fallback към Dummy
+            from training.move_encoding import get_total_move_count
+            class DummyModel(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.output_size = get_total_move_count()
+
+                def forward(self, x):
+                    return torch.randn(x.shape[0], self.output_size), torch.tanh(torch.randn(x.shape[0], 1))
+
+            self.model = DummyModel().to(self.device)
+
+        # Използваме твоя MCTS клас
+        self.mcts = MCTS(self.model, self.device, simulations=200)
 
     def select_move(self, board):
         move, _ = self.select_move_with_info(board)
         return move
 
     def select_move_with_info(self, board):
+        """
+        Адаптер между твоя MCTS и GUI анализа.
+        """
         try:
-            legal_moves = list(board.legal_moves)
-            if not legal_moves:
+            # 1. Стартираме MCTS (използваме run_with_Q, за да вземем и оценките)
+            # Приемаме, че move_number не е задължителен тук
+            pi, Q = self.mcts.run_with_Q(board)
+
+            if not pi:
                 return None, {}
 
-            fake_policy = {}
-            total_p = 0
-            for m in legal_moves:
-                p = random.random()
-                fake_policy[m] = p
-                total_p += p
+            # 2. Намираме най-добрия ход (този с най-много посещения/най-високо pi)
+            # Избираме хода, който MCTS е изследвал най-много (най-надеждният ход)
+            root = self.mcts.last_root
+            if root and root.children:
+                best_move = max(root.children.keys(), key=lambda m: root.children[m].visit_count)
+            else:
+                best_move = max(pi, key=pi.get)
 
-            entropy = 0.0
+            # 3. Подготвяме данни за TopMovesWidget (панела вдясно)
             top_moves_data = []
-            total_sims_demo = 80
+            entropy = 0.0
+            root = self.mcts.last_root
 
-            for m in legal_moves:
-                prob = fake_policy[m] / total_p if total_p > 0 else 0
+            for move, prob in pi.items():
                 if prob > 0:
                     entropy -= prob * math.log(prob)
 
-                visits = int(prob * total_sims_demo)
-                dummy_pv = f"{board.san(m)} ... (simulated line)"
-                top_moves_data.append((m, board.san(m), prob, visits, dummy_pv))
+                # Взимаме посещенията от децата на корена в MCTS
+                visits = root.children[move].visit_count if root and move in root.children else 0
 
+                # Линия за прогноза (PV) - тук просто показваме хода
+                pv_line = f"{board.san(move)} (Q: {Q.get(move, 0.0):.2f})"
+
+                top_moves_data.append((move, board.san(move), prob, visits, pv_line))
+
+            # Сортираме за GUI списъка
             top_moves_data.sort(key=lambda x: x[2], reverse=True)
-            best_move = legal_moves[0]
-            fake_value = (random.random() * 2) - 1
+
+            # 4. Взимаме общата оценка на позицията (Q стойността на корена)
+            # В MCTS коренът няма Q директно, ползваме средното Q на най-добрия ход
+            current_eval = Q.get(best_move, 0.0)
 
             info = {
-                "value": fake_value,
+                "value": current_eval,
                 "top_moves": top_moves_data[:6],
-                "simulations": total_sims_demo,
-                "policy": fake_policy,
+                "simulations": self.mcts.simulations,
+                "policy": pi,
                 "entropy": entropy
             }
 
-            print(f"AI избра: {best_move} (Eval: {fake_value:.2f}, Ent: {entropy:.2f})")
+            # В app.py
+            for move_data in top_moves_data[:3]:
+                print(f"Ход: {move_data[1]}, Вероятност: {move_data[2]:.4f}, Q-стойност: {move_data[4]}")
             return best_move, info
 
         except Exception as e:
-            print(f"ГРЕШКА в MCTS: {e}")
+            print(f"ГРЕШКА при MCTS анализ: {e}")
             import traceback
             traceback.print_exc()
             return None, {}
-
 
 # =========================================================
 # MAIN WINDOW
@@ -121,7 +165,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Chess AI")
         self.setMinimumSize(1100, 650)
 
-        # --- УМНО ЗАРЕЖДАНЕ НА ИКОНА (Code Fix) ---
+
+        # ICON
         try:
             base_pixmap = QPixmap("assets/barbie/icon-logo.png")
             if not base_pixmap.isNull():
