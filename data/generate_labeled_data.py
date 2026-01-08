@@ -6,6 +6,10 @@ import multiprocessing
 import time
 import os
 
+from config.paths import DATASETS_DIR
+from pathlib import Path
+
+
 from training.move_encoding import move_to_index, get_total_move_count
 
 TOTAL_MOVES = get_total_move_count()
@@ -170,9 +174,10 @@ def save_batch(samples, folder_path, prefix, batch_idx):
     if not samples: return
     states, policies, values = zip(*samples)
 
-    path_states = os.path.join(folder_path, f"{prefix}_states_{batch_idx}.npy")
-    path_policies = os.path.join(folder_path, f"{prefix}_policies_{batch_idx}.npy")
-    path_values = os.path.join(folder_path, f"{prefix}_values_{batch_idx}.npy")
+    folder_path = Path(folder_path)
+    path_states = folder_path / f"{prefix}_states_{batch_idx}.npy"
+    path_policies = folder_path / f"{prefix}_policies_{batch_idx}.npy"
+    path_values = folder_path / f"{prefix}_values_{batch_idx}.npy"
 
     np.save(path_states, np.array(states, dtype=np.float32))
     np.save(path_policies, np.array(policies, dtype=np.float32))
@@ -182,9 +187,9 @@ def save_batch(samples, folder_path, prefix, batch_idx):
 
 
 def parallel_process_games(rows, output_folder, file_prefix, num_workers=6, games_per_chunk=1000):
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-        print(f"Created directory: {output_folder}")
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    print(f"Created directory: {output_folder}")
 
     print(f"Starting processing for '{file_prefix}' -> {output_folder} ...")
 
@@ -218,12 +223,15 @@ def parallel_process_games(rows, output_folder, file_prefix, num_workers=6, game
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
-    PROJECT_ROOT = "/home/presi/projects/chess_ai_project"
-    DB_PATH = os.path.join(PROJECT_ROOT, "data/datachess_games.db")
+    DB_PATH = DATASETS_DIR / "datachess_games.db"
 
-    TRAIN_DIR = os.path.join(PROJECT_ROOT, "data/processed/train")
-    VAL_DIR = os.path.join(PROJECT_ROOT, "data/processed/val")
-    TEST_DIR = os.path.join(PROJECT_ROOT, "data/processed/test")
+    PROCESSED_DIR = DATASETS_DIR / "processed"
+    TRAIN_DIR = PROCESSED_DIR / "train"
+    VAL_DIR = PROCESSED_DIR / "val"
+    TEST_DIR = PROCESSED_DIR / "test"
+
+    for d in [TRAIN_DIR, VAL_DIR, TEST_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
 
     print(f"Reading games from {DB_PATH}...")
     conn = sqlite3.connect(DB_PATH)

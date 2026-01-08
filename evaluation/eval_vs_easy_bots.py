@@ -1,16 +1,15 @@
-import sys
-import os
 import random
 import chess
 import torch
 import numpy as np
 
+from config.paths import CHECKPOINTS_DIR
+from pathlib import Path
+
 # ==========================
 # SETUP PATHS
 # ==========================
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+
 
 from models.AlphaZero import AlphaZeroModel
 from training.mcts import MCTS
@@ -19,7 +18,7 @@ from training.mcts import MCTS
 # CONFIG
 # ==========================
 # Използваме релативен път, за да е по-сигурно
-MODEL_PATH = os.path.join(PROJECT_ROOT, "training/rl/checkpoints/alpha_zero_rl_checkpoint_final.pth")
+MODEL_PATH = CHECKPOINTS_DIR / "alpha_zero_rl_checkpoint_final.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -132,15 +131,8 @@ def play_debug_game(model, ai_color):
 
 if __name__ == "__main__":
     print(f"Loading RL Model: {MODEL_PATH}")
-    if not os.path.exists(MODEL_PATH):
-        print("❌ MODEL NOT FOUND!")
-        # Опит с абсолютен път, ако горното не работи
-        ALT_PATH = "/home/presi/projects/chess_ai_project/training/rl/checkpoints/alpha_zero_rl_checkpoint_final.pth"
-        if os.path.exists(ALT_PATH):
-            print(f"Found at absolute path: {ALT_PATH}")
-            MODEL_PATH = ALT_PATH
-        else:
-            exit()
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {MODEL_PATH}")
 
     model = AlphaZeroModel().to(DEVICE)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
